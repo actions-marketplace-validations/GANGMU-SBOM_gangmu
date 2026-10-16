@@ -31,11 +31,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import yaml
 
 from ..dirprint import DEFAULT_EXCLUDE, DEFAULT_INCLUDE, print_directory
-from .common import (ProjectImport, VendoredProject, clone_metadata, dump_rule,
-                     fetch_at, git as _git_run, make_rule)
+from .common import (ProjectImport, VendoredProject, clone_metadata, fetch_at, git as _git_run, make_rule)
 
 _SECTION = re.compile(r'^\[submodule "(?P<name>[^"]+)"\]\s*$')
 _KEYVAL = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.-]+)\s*=\s*(?P<val>.*?)\s*$")
@@ -199,8 +197,9 @@ def import_gitmodules(sdk_repo: str, vendor: str, sdk: str,
             module, depth = queue.pop(0)
             rule_id = f"{vendor}/{sdk}/{Path(module.path).name}"
             if not module.sha:
-                results.append(SubmoduleImport(module, rule_id, "error",
-                                               "no pinned commit in the SDK tree"))
+                results.append(SubmoduleImport(
+                    VendoredProject(name=module.name, path=module.path, url=module.url),
+                    rule_id, "error", "no pinned commit in the SDK tree"))
                 continue
             if (module.url, module.sha) in seen:
                 continue           # the same pin reached by two paths

@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .core.walk import NOT_CONTENT_DIRS
+
 ECOSYSTEM_RTTHREAD = "rt-thread"
 ECOSYSTEM_OPENHARMONY = "openharmony"
 
@@ -50,7 +52,7 @@ OPENSOURCE_README = "README.OpenSource"
 OPENHARMONY_BUNDLE = "bundle.json"
 OPENHARMONY_SUPPLIER = "OpenAtom Foundation (OpenHarmony project)"
 THIRD_PARTY_SUBSYSTEM = "thirdparty"
-_SKIP_DIRS = {".git", "out", "build", "node_modules", "__pycache__"}
+_SKIP_DIRS = NOT_CONTENT_DIRS | {"out", "build"}
 
 _PKG_USING = re.compile(r"^CONFIG_PKG_USING_([A-Z0-9_]+)=y\s*$", re.M)
 _PKG_STRING = re.compile(r'^CONFIG_PKG_([A-Z0-9_]+?)_(PATH|VER)="([^"]*)"\s*$', re.M)
@@ -86,11 +88,12 @@ class Declaration:
             # The package index is RT-Thread's own namespace; the version is the
             # package's, so it belongs with that namespace and nowhere else.
             base = f"pkg:generic/rt-thread/{_purl_name(self.name)}"
-        elif self.ecosystem in ("conan", "bazel"):
+        elif self.ecosystem in ("conan", "bazel", "cargo"):
             base = f"pkg:{self.ecosystem}/{_purl_name(self.name)}"
         elif self.supplier == OPENHARMONY_SUPPLIER:
             base = f"pkg:generic/openharmony/{_purl_name(self.name)}"
-        elif self.cpe or self.ecosystem in ("buildroot", "openwrt", "kbuild", "yocto"):
+        elif self.cpe or self.ecosystem in ("buildroot", "openwrt", "kbuild", "yocto",
+                                            "dpkg", "opkg", "apk"):
             base = f"pkg:generic/{_purl_name(self.name)}"
         else:
             github = _github_purl(self.upstream_url)
@@ -274,7 +277,9 @@ def _read_bundle(path: Path) -> Optional[dict]:
     subsystem = _field(component, "subsystem")
     if not name or not subsystem:
         return None
-    deps = component.get("deps") if isinstance(component.get("deps"), dict) else {}
+    deps = component.get("deps")
+    if not isinstance(deps, dict):
+        deps = {}
     depends_on: List[str] = []
     for key in ("components", "third_party"):
         for dep in deps.get(key) or []:

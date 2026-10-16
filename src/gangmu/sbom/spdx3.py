@@ -12,15 +12,15 @@ The document is validated against the published 3.0.1 JSON schema in the tests.
 
 from __future__ import annotations
 
-import datetime as _dt
 import re
-import uuid
 from typing import Any, Dict, List, Optional
 
 from .. import __version__
 from ..licenses import differs, observed_ids, spdx_license_declared
 from ..model import Finding, ScanResult
 from ..support import UNKNOWN, describe as describe_support
+from ..binaries import describe_binary
+from ..core import repro
 
 CONTEXT = "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"
 SPEC_VERSION = "3.0.1"
@@ -38,7 +38,7 @@ _SUPPORT_LEVEL = {
 
 
 def _now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return repro.timestamp()
 
 
 class _Doc:
@@ -150,7 +150,7 @@ def to_spdx3(result: ScanResult, app_name: str = "firmware",
              timestamp: Optional[str] = None,
              namespace: Optional[str] = None) -> Dict[str, Any]:
     created = timestamp or _now()
-    doc = _Doc(namespace or f"https://gangmu.dev/spdx/{uuid.uuid4()}", created)
+    doc = _Doc(namespace or f"https://gangmu.dev/spdx/{repro.ID_PLACEHOLDER}", created)
 
     tool = doc.add({"type": "Tool", "spdxId": doc.iri("tool", "gangmu-sbom"),
                     "name": f"gangmu-sbom-{__version__}"})
@@ -173,19 +173,24 @@ def to_spdx3(result: ScanResult, app_name: str = "firmware",
         members.append(pkg_id)
         if finding.component_name:
             by_name.setdefault(finding.component_name, []).append(pkg_id)
+    inside: List[Any] = []
     for blob in result.binaries:
-        comment = ("prebuilt " + blob.kind + ", no source available"
-                   + (f"; embeds {', '.join((e.display_name + ' ' + e.version).strip() for e in blob.embedded)}"
-                      if blob.embedded else ""))
-        members.append(doc.add({
+        comment = describe_binary(blob)
+        added = doc.add({
             "type": "software_Package", "spdxId": doc.iri("binary", blob.path),
             "name": blob.path, "software_packageVersion": "NOASSERTION",
             "software_primaryPurpose": "file",
             "verifiedUsing": [{"type": "Hash", "algorithm": "sha256",
                                "hashValue": blob.sha256}],
-            "comment": comment}))
+            "comment": comment})
+        if blob.container:                  # contained by the file it was found in
+            inside.append((doc.iri("binary", blob.container), added))
+        else:
+            members.append(added)
     if members:
         doc.relate(root, "contains", members)
+    for outer, inner in inside:
+        doc.relate(outer, "contains", [inner])
     for finding, pkg_id in zip(result.findings, ids):
         for name in finding.depends_on:
             targets = [t for t in by_name.get(name, []) if t != pkg_id]
@@ -210,4 +215,5 @@ def to_spdx3(result: ScanResult, app_name: str = "firmware",
     doc.add(document)
     document["element"] = [e["spdxId"] for e in doc.elements
                            if e["spdxId"] != document["spdxId"]]
-    return {"@context": CONTEXT, "@graph": [creation_info] + doc.elements}
+    return repro.fill_document_id({"@context": CONTEXT,
+                                   "@graph": [creation_info] + doc.elements})

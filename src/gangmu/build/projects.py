@@ -23,7 +23,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from .compile_db import CompileDB, CompileEntry
 
@@ -222,7 +222,7 @@ def parse_ccs_project(path: Path, configuration: Optional[str] = None) -> Projec
         except ET.ParseError as exc:
             out.notes.append(f".cproject is not valid XML: {exc}")
 
-    from ..globbing import matches_suffix
+    from ..core.globbing import matches_suffix
     seen: Set[Path] = set(out.sources)
     for base in roots:
         for candidate in sorted(base.rglob("*")):
@@ -242,7 +242,7 @@ def parse_ccs_project(path: Path, configuration: Optional[str] = None) -> Projec
     return out
 
 
-PARSERS = {
+PARSERS: Dict[str, Callable[..., ProjectParse]] = {
     ".ewp": parse_iar_ewp,
     ".uvprojx": parse_keil_uvprojx,
     ".uvproj": parse_keil_uvprojx,

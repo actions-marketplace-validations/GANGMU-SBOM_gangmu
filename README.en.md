@@ -7,7 +7,9 @@ Gangmu identifies open-source components that chip-vendor SDKs have renamed,
 modified and statically linked (including Chinese silicon SDKs and Chinese
 commercial cryptography libraries such as GmSSL and Tongsuo), writes CycloneDX
 and SPDX SBOMs with VEX, checks them against the EU Cyber Resilience Act, and
-drafts CRA Article 14 and China MIIT vulnerability reports.
+drafts CRA Article 14 and China MIIT vulnerability reports. The same engine also lists the
+cryptographic algorithms in a firmware (CBOM, with a post-quantum migration summary) and its
+machine-learning models (AIBOM).
 
 [![ci](https://github.com/GANGMU-SBOM/gangmu/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GANGMU-SBOM/gangmu/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/gangmu-sbom.svg)](https://pypi.org/project/gangmu-sbom/)
@@ -17,7 +19,7 @@ drafts CRA Article 14 and China MIIT vulnerability reports.
 [![CycloneDX 1.6](https://img.shields.io/badge/CycloneDX-1.6-green.svg)](https://cyclonedx.org/)
 [![SPDX 2.3](https://img.shields.io/badge/SPDX-2.3-green.svg)](https://spdx.dev/)
 
-[中文](README.md) · [Rules: gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules) · [Benchmark: gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench) · [FAQ](docs/FAQ.en.md) · [Glossary](docs/GLOSSARY.md) · [Rule format](docs/RULE-FORMAT.md) · [Benchmark](docs/BENCHMARK.md) · [CRA](docs/CRA.md) · [China](docs/CHINA.md) · [Example output](examples/output/) · [Comparison](docs/COMPARE.md)
+[中文](README.md) · [Rules: gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules) · [Benchmark: gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench) · [FAQ](docs/FAQ.en.md) · [Glossary](docs/GLOSSARY.md) · [Rule format](docs/RULE-FORMAT.md) · [Benchmark](docs/BENCHMARK.md) · [CRA](docs/CRA.md) · [China](docs/CHINA.md) · [Example output](examples/output/) · [Comparison](docs/COMPARE.md) · [CBOM guide (中文)](docs/guides/cbom-post-quantum.md) · [AIBOM guide (中文)](docs/guides/aibom.md) · [Policy check (中文)](docs/guides/policy.md)
 
 The Chinese README is the primary document; this is a shorter English version.
 
@@ -100,12 +102,14 @@ gangmu wrap -o compile_commands.json -- make -j8          # or watch a real buil
 # LICENSE text is recognised only for a few unmistakable permissive licences; copyleft is trusted from SPDX headers only. --no-licenses turns it off.
 gangmu vuln-fetch --db advisories/ --sbom sbom.json       # online step: only what this SBOM can match
 gangmu vuln-fetch --db advisories/ --threat                  # also CISA KEV + EPSS; `vuln` then ranks by exploited > EPSS > CVSS, `--fail-on kev` gates on KEV
-gangmu vuln sbom.json --db advisories/ --source ROOT [--symbols syms.json] [--reachability-vex]   # per finding: is the vulnerable function absent, unreferenced, or reachable from your code? Over-approximate source call graph (names, macros, tables); VEX is only changed with --reachability-vex
+gangmu vuln sbom.json --db advisories/ --source ROOT [--symbols syms.json] [--reachability-vex]   # per finding: is the vulnerable function absent, unreferenced, or reachable from your code? Over-approximate source call graph (names, macros, tables); branches the build configuration rules out (`--config`, `-D`) are not counted; VEX is only changed with --reachability-vex
 gangmu patch-build CVE-2025-1866 --db advisories/ -o patches.json   # record the functions the fix changed (fix commit read from the OSV record; or --repo URL --fix SHA)
 gangmu vuln sbom.json --db advisories/ --source ROOT --patches patches.json   # test the code, not the version: fixed body present -> resolved, vulnerable body present -> exploitable, edited -> left for a person (a near-identical variant is reported as likely_fixed / likely_vulnerable; --patch-near-vex lets it change the state)
 gangmu patch-verify rules/patches/*.json   # rebuild every patch record from the upstream commits it names; fails on any difference
 # Records in an installed rule pack's patches/ directory are used by `vuln --source` on their own (--no-pack-patches to skip).
-gangmu rules index rules/                                   # precompile a rule directory (125 rules: 0.67 s -> 0.02 s to load); each entry is checked by file hash, so a stale index only costs speed
+gangmu rules index rules/                                   # precompile a rule directory (98 rules: about 0.6 s -> 0.04 s to load); each entry is checked by file hash, so a stale index only costs speed
+gangmu merge ours.cdx.json vendor.cdx.json yocto.cdx.json -o product.cdx.json [--fail-on-disagreement]   # join CycloneDX documents (same purl, or name + version, is one component; the first document wins; version and VEX disagreements are reported)
+gangmu license-check sbom.json [--fail-on copyleft|incompatible|unlicensed]   # triage licences: copyleft, possibly incompatible pairs (per the FSF list), components with no licence; a prompt for a person, not a legal conclusion
 gangmu keygen && gangmu sign sbom.json --key gangmu-signing.key   # detached Ed25519 signature (pip install gangmu-sbom[sign])
 gangmu sign-verify sbom.json --pubkey gangmu-signing.pub   # PEM keys, OpenSSL verifies them too; no timestamp: use cosign for that
 gangmu vuln sbom.json --db advisories/ -o vex.json        # local NVD/OSV mirror -> CycloneDX VEX
@@ -135,10 +139,55 @@ The GitHub Action is listed on the [GitHub Marketplace](https://github.com/marke
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/GANGMU-SBOM/gangmu
-  rev: v0.7.1
+  rev: v0.10.0
   hooks:
     - id: gangmu-scan
 ```
+
+That action writes the SBOM only. To get the SBOM, a CBOM and a post-quantum migration summary in one step, and to fail
+the job when a quantum-vulnerable algorithm is found, use [gangmu-action](https://github.com/GANGMU-SBOM/gangmu-action):
+
+```yaml
+- uses: GANGMU-SBOM/gangmu-action@main
+  with:
+    compile-db: build/compile_commands.json
+    fail-on: quantum-vulnerable
+```
+
+The migration summary needs gangmu 0.9 or later.
+
+### Cryptographic BOM (CBOM) and AI BOM (AIBOM)
+
+```bash
+gangmu cbom . --compile-db build/compile_commands.json --link-map build/fw.map          # table
+gangmu cbom . ... --format cyclonedx -o cbom.json --fail-on quantum-vulnerable           # CycloneDX 1.6 CBOM
+gangmu cbom . ... --format readiness -o pqc-readiness.md   # post-quantum migration summary (Markdown)
+gangmu cbom . --libraries                                  # also add what the identified libraries provide
+gangmu aibom . --format cyclonedx -o aibom.json            # ML models and inference runtimes
+```
+
+`gangmu cbom` lists the cryptographic algorithms named in sources, configuration, prebuilt libraries and firmware
+images, each with its quantum status (RSA, ECDSA, ECDH and SM2 are broken by a quantum computer). With build facts it
+counts only what was built. `--format readiness` and `--libraries` are available from 0.9. The summary groups
+algorithms into migrate / replace now / already post-quantum / symmetric and names the NIST replacement. The algorithm
+table can be extended by rule packs: [gangmu-cbom-rules](https://github.com/GANGMU-SBOM/gangmu-cbom-rules) holds an export
+of the built-in table, a few post-quantum candidates and "library version to algorithms" tables for Mbed TLS, wolfSSL,
+OpenSSL, Tongsuo and GmSSL. It is not on PyPI yet; clone it and pass `--rules gangmu-cbom-rules/rules`.
+
+`gangmu aibom` finds model files by signature or extension (TensorFlow Lite, GGUF, ExecuTorch, ONNX, safetensors,
+PyTorch and others, each with a SHA-256; TensorFlow Lite models compiled into a C array too) and inference runtimes by
+identifier (TFLite Micro, CMSIS-NN, Edge Impulse, ONNX Runtime, llama.cpp and others). Training data, licence and intended
+use cannot be read from a model file; a person writes them in `gangmu-aibom.yaml` at the root (or `--declarations FILE`),
+and they are merged into the output marked as declared, not checked. `--require-declarations` exits 1 when a model has
+no declared licence or training data. The recognition tables can be extended with a rule pack (`--rules`, [gangmu-aibom-rules](https://github.com/GANGMU-SBOM/gangmu-aibom-rules)). Build facts are not used yet, so a runtime named in a source file may not be in
+the build. Both guides are in Chinese for now:
+[CBOM](docs/guides/cbom-post-quantum.md), [AIBOM](docs/guides/aibom.md), [policy check](docs/guides/policy.md).
+
+`gangmu policy check` reads the CBOM and AIBOM against policies written as data (`policies/*.yaml` in a rule pack of
+kind `policy`, each with a source and `deprecated-after` / `disallowed-after` dates). Every check ends `ok`, `due`
+(not yet in force: the migration backlog), `deprecated` or `fail` as of `--as-of`; `--fail-on` is the CI gate; output is
+a table, Markdown or JSON. It gives no legal conclusion and does not inspect key sizes. The format and engine are open;
+the maintained regulatory packs (NIST IR 8547 and others) are the commercial gangmu-policy-pro.
 
 ## What it recognises
 
@@ -146,8 +195,8 @@ The GitHub Action is listed on the [GitHub Marketplace](https://github.com/marke
 | --- | --- | --- |
 | General open-source components | lwIP, Mbed TLS, FreeRTOS, RT-Thread, LVGL, OpenSSL, littlefs, FatFs, libcoap, nghttp2 and more | Directory location plus function-level fingerprints; the version comes from which releases the matched functions belong to |
 | National-crypto libraries | GmSSL 2.x / 3.x, Tongsuo | Per-release anchors, multi-release function signatures and version probes; code is split against OpenSSL so neither is mistaken for the other |
-| Package-manager and ecosystem declarations | RT-Thread, OpenHarmony, Yocto, Buildroot / OpenWrt, PlatformIO, Conan, Bazel, Zephyr `module.yml` | Read directly; where a declaration and the code disagree, the code wins and the disagreement is recorded as evidence |
-| Zephyr and its HALs | Mbed TLS, hostap, MCUboot, nanopb, and the Bouffalo, WCH, SiFli, Telink, Realtek and GigaDevice HALs | Rules generated from Zephyr's pinned commits |
+| Package-manager and ecosystem declarations | RT-Thread, OpenHarmony, Yocto, Buildroot / OpenWrt, PlatformIO, Conan, Bazel, CMake (FetchContent / ExternalProject / CPM), vcpkg, Meson wraps, Cargo `*-sys`, STM32Cube / CMSIS-Pack, dpkg / opkg / apk databases, Zephyr `module.yml` | Read directly; where a declaration and the code disagree, the code wins and the disagreement is recorded as evidence |
+| Zephyr and its HALs | Mbed TLS, hostap, MCUboot, nanopb, and the Bouffalo, WCH, SiFli, Telink, Realtek, GigaDevice, STM32, NXP, Nordic, TI, Renesas, Silicon Labs and Infineon HAL modules | Rules generated from Zephyr's pinned commits |
 | Kernels and libraries inside Chinese SDKs | FreeRTOS / RT-Thread / LiteOS / TencentOS-tiny / AliOS Things kernels, FreeType, Opus and others | Located by marker files, independent of directory names |
 
 For what each Chinese ecosystem does and does not cover see [docs/CHINA.md](docs/CHINA.md); for what each release added see [docs/CHANGELOG.en.md](docs/CHANGELOG.en.md).
@@ -164,8 +213,8 @@ The rules come in two parts: the free gangmu-rules holds the general open-source
 and its HAL modules, and community contributions; rules tied to one company (its own SDK, its firmware library, or an
 open-source component it forked) belong to the commercial rule packs: contact us (see the end of this page). Rule ids are the same on both sides and the commercial packs overlay automatically once installed. CI re-derives every rule's evidence from the upstream
 release it names (`gangmu rules verify`), so review cost is close to zero.
-Rules never guess a CPE: 29 of the 60 free rules carry one, new ones citing the NVD records
-that prove it, and the other 31 say why they have none. PURL is a first-class
+Rules never guess a CPE: 53 of the 98 free rules carry one, new ones citing the NVD records
+that prove it, and the other 45 say why they have none. PURL is a first-class
 matching channel. See [contributing a rule](https://github.com/GANGMU-SBOM/gangmu-rules/blob/main/CONTRIBUTING.md).
 
 Chinese vendors and projects with at least one rule or SDK reader (depth differs per vendor):
@@ -180,7 +229,7 @@ repository because no vendor's brand terms were checked. See
 
 Listed plainly, because the gaps are the roadmap. The main ones:
 
-- **No deep binary analysis:** without source or a build, only an inventory, version banners and function boundaries, as lower-confidence supporting evidence.
+- **No deep binary analysis:** without source or a build, only an inventory, version banners and function boundaries, as lower-confidence supporting evidence. For `.exe`/`.dll` it also reads the PE structure, the dependency lists the Go and Rust toolchains write into the file, .NET metadata and `deps.json`; what each kind of evidence proves, and how it was checked, is in [docs/BINARY-SBOM.md](docs/BINARY-SBOM.md).
 - **Small evaluation and rule base:** the method is right, the scale is not yet; contributions welcome.
 - **`gangmu vuln` never touches the network:** the online step is the separate `gangmu vuln-fetch`, so it works inside an air-gapped network.
 - **The compiler wrapper only intercepts compilers found by name.**
@@ -189,15 +238,18 @@ Details, reasons and workarounds for each: [docs/LIMITS.en.md](docs/LIMITS.en.md
 
 ## Repositories
 
-Gangmu is three public repositories and two private ones, released independently:
+Gangmu is a set of public repositories, released independently (`gangmu-sbom` and `gangmu-rules` are on PyPI; `gangmu-cbom-rules`, `gangmu-aibom-rules` and `gangmu-action` come from GitHub for now):
 
 | Repository | What is in it | Licence |
 | --- | --- | --- |
 | **[gangmu](https://github.com/GANGMU-SBOM/gangmu)** (this one) | Identification engine, CLI, build-time collection, SBOM and VEX output, vulnerability matching, CRA and MIIT report drafts | Apache-2.0 |
 | **[gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules)** | The free rule base: the general open-source components vendor SDKs copy most, plus Zephyr and its HALs, released by date (`pip install -U gangmu-rules`) | CDLA-Permissive-2.0 |
 | **[gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench)** | The benchmark: pinned real upstream releases with their correct answers and a scoring script anyone can re-run | Apache-2.0 |
+| **[gangmu-cbom-rules](https://github.com/GANGMU-SBOM/gangmu-cbom-rules)** | CBOM rules: the algorithm table and library capability tables, loaded with `gangmu cbom --rules`; not on PyPI yet | CDLA-Permissive-2.0 (rules), Apache-2.0 (packaging code) |
+| **[gangmu-action](https://github.com/GANGMU-SBOM/gangmu-action)** | GitHub Action: SBOM, CBOM and post-quantum summary in one step, with an optional fail gate | Apache-2.0 |
+| **[gangmu-aibom-rules](https://github.com/GANGMU-SBOM/gangmu-aibom-rules)** | The free AIBOM rule base: the model formats and inference runtimes `gangmu aibom` recognises, as a rule pack; not on PyPI yet | CDLA-Permissive-2.0 (rules), Apache-2.0 (packaging code) |
 
-The commercial edition (rule packs, monitoring, reporting workbench) is not in these repositories; see [docs/EDITIONS.md](docs/EDITIONS.md).
+The commercial edition lives in private repositories, not in the ones above: the per-company commercial rule packs (gangmu-rules-pro; rule ids match the free base and the packs overlay automatically once installed), the compliance policy packs (gangmu-policy-pro), and licensing and enterprise services (gangmu-enterprise). See [docs/EDITIONS.md](docs/EDITIONS.md).
 
 `pip install gangmu-sbom` installs gangmu-rules for you. Where to file what: a wrong
 identification or a missing SDK rule goes to gangmu-rules; a crash, a CLI or an output
@@ -233,7 +285,7 @@ for technical consulting and business enquiries see [Contact](#contribute-rules-
 
 ## Licence
 
-Tool: Apache-2.0. Rules ([gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules)): CDLA-Permissive-2.0. Commercial rule packs: proprietary. Benchmark ([gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench)): Apache-2.0.
+Tool: Apache-2.0. Rules ([gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules)): CDLA-Permissive-2.0. Commercial rule packs: proprietary. Benchmark ([gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench)): Apache-2.0. CBOM rules ([gangmu-cbom-rules](https://github.com/GANGMU-SBOM/gangmu-cbom-rules)): CDLA-Permissive-2.0 for the rule data, Apache-2.0 for the packaging code. [gangmu-action](https://github.com/GANGMU-SBOM/gangmu-action): Apache-2.0.
 
 ```bash
 git clone https://github.com/GANGMU-SBOM/gangmu-rules

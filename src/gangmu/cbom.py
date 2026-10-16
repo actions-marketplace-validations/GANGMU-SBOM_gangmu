@@ -22,10 +22,8 @@ another name, and it says nothing about key sizes, key storage or protocol use.
 from __future__ import annotations
 
 import bisect
-import datetime as _dt
 import os
 import re
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -33,7 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from . import __version__
 from .binaries import FIXTURE_DIRS, IMAGE_SUFFIXES, MAX_BANNER_BYTES, SKIP_DIRS
 from .build.facts import BuildFacts
-from .unpack import expand
+from .core.packs import RuleRoot, check_manifest, default_roots, read_manifest
+from .core.unpack import expand
+from .core import repro
 
 SPEC_VERSION = "1.6"
 
@@ -93,7 +93,7 @@ ALGOS: Tuple[Algo, ...] = (
         "Chinese national hash (256-bit output)."),
     Algo("sm2", "SM2", "signature", VULNERABLE, (
         _B + r"(?:sm2_(?:sign|verify|encrypt|decrypt|do_sign|do_verify)\w*|SM2_(?:sign|verify|encrypt|"
-        r"decrypt|compute_z_digest)\w*|mbedtls_sm2_\w+|MBEDTLS_ECP_DP_SM2\w*|\bsm2p256v1\b)",),
+        r"decrypt|compute_z_digest)\w*|mbedtls_sm2_\w+|ossl_sm2_\w+|MBEDTLS_ECP_DP_SM2\w*|\bsm2p256v1\b)",),
         "Elliptic-curve scheme: a quantum computer breaks it like ECDSA."),
     Algo("md5", "MD5", "hash", BROKEN, (
         _B + r"(?:mbedtls_md5\w*|MD5_(?:Init|Update|Final)\b|MD5Init\b|MD5Update\b|wc_Md5\w+|"
@@ -114,7 +114,7 @@ ALGOS: Tuple[Algo, ...] = (
         r"PSA_ALG_SHA_(?:384|512)\b)",),
         "SHA-384 and up are the sizes the post-quantum guidance names."),
     Algo("sha-3", "SHA-3", "hash", SYMMETRIC, (
-        _B + r"(?:mbedtls_sha3\w*|SHA3_\w+|wc_Sha3_\w+|MBEDTLS_SHA3_C\b|keccak_\w+|PSA_ALG_SHA3_\w+)",),
+        _B + r"(?:mbedtls_sha3_\w+|SHA3_\w+|wc_Sha3_\w+|MBEDTLS_SHA3_C\b|keccak_\w+|PSA_ALG_SHA3_\w+)",),
         ""),
     Algo("hmac", "HMAC", "mac", SYMMETRIC, (
         _B + r"(?:mbedtls_md_hmac\w*|HMAC_(?:Init|Update|Final|CTX)\w*|wc_Hmac\w+|PSA_ALG_HMAC\b|"
@@ -144,7 +144,7 @@ ALGOS: Tuple[Algo, ...] = (
         "Broken by Shor's algorithm at every curve."),
     Algo("ed25519", "Ed25519", "signature", VULNERABLE, (
         _B + r"(?:ed25519_(?:sign|verify|create_keypair|publickey)\w*|wc_ed25519_\w+|"
-        r"crypto_sign_ed25519\w*|MBEDTLS_ECP_DP_CURVE448\b|\bEd25519\b)",),
+        r"crypto_sign_ed25519\w*|\bEd25519\b)",),
         "Elliptic-curve scheme: broken by Shor's algorithm."),
     Algo("x25519", "X25519", "key-agree", VULNERABLE, (
         _B + r"(?:curve25519_\w+|x25519_\w+|wc_curve25519\w*|crypto_scalarmult_curve25519\w*|"
@@ -177,9 +177,196 @@ _AES_MODES = {"CBC": "cbc", "ECB": "ecb", "CCM": "ccm", "GCM": "gcm", "CFB": "cf
               "OFB": "ofb", "CTR": "ctr", "XTS": "other"}
 _AES_QUANTUM_LEVEL = {"128": 1, "192": 3, "256": 5}
 
-_ALGO_RE: List[Tuple[Algo, "re.Pattern[bytes]"]] = [
-    (a, re.compile("|".join(a.patterns).encode("ascii"))) for a in ALGOS]
-_BY_KEY: Dict[str, Algo] = {a.key: a for a in ALGOS}
+PRIMITIVES = frozenset({"drbg", "mac", "block-cipher", "stream-cipher", "signature", "hash",
+                        "pke", "xof", "kdf", "key-agree", "kem", "ae", "combiner", "key-wrap",
+                        "other"})                # CycloneDX algorithmProperties.primitive
+QUANTUM_STATUSES = frozenset({VULNERABLE, SYMMETRIC, PQC, BROKEN, NEUTRAL})
+ALGO_DIR = "algorithms"       # inside a rule pack of kind ``cbom``
+
+
+class CbomRuleError(ValueError):
+    """An algorithm rule that cannot be loaded."""
+
+
+class AlgoSet:
+    """The algorithms a scan looks for: the built-in table, overlaid by rule packs.
+
+    A pack entry with the key of a built-in replaces it; a new key adds an algorithm.
+    """
+
+    def __init__(self, algos: Iterable[Algo], sources: Sequence[str] = (),
+                 libraries: Optional[Dict[str, "Library"]] = None) -> None:
+        by_key: Dict[str, Algo] = {}
+        for a in algos:
+            by_key[a.key] = a                    # dicts keep first-seen order on replacement
+        self.algos: List[Algo] = list(by_key.values())
+        self.by_key = by_key
+        self.sources: List[str] = list(sources)
+        self.libraries: Dict[str, "Library"] = dict(libraries or {})
+        self.regexes: List[Tuple[Algo, "re.Pattern[bytes]"]] = [
+            (a, re.compile("|".join(a.patterns).encode("ascii"))) for a in self.algos]
+
+
+@dataclass(frozen=True)
+class Release:
+    """One span of a library's versions and the algorithms its source provides there."""
+    algorithms: Tuple[str, ...]
+    introduced: Optional[str] = None
+    fixed: Optional[str] = None           # exclusive upper bound
+    source: str = ""                      # where a reviewer can check the claim
+
+    def holds(self, version: str) -> Optional[bool]:
+        from .vuln.version import in_range
+        if self.introduced is None and self.fixed is None:
+            return True
+        return in_range(version, introduced=self.introduced, fixed=self.fixed)
+
+
+@dataclass(frozen=True)
+class Library:
+    rule: str                             # id of the SBOM rule that identifies the library
+    name: str
+    releases: Tuple[Release, ...]
+
+    def algorithms_for(self, version: str) -> Optional[Tuple[str, ...]]:
+        """The algorithms of the release span holding *version*; None when no span
+        does or the version cannot be ordered."""
+        for release in self.releases:
+            verdict = release.holds(version)
+            if verdict:
+                return release.algorithms
+        return None
+
+
+LIBRARY_DIR = "libraries"     # inside a rule pack of kind ``cbom``
+
+
+def _library_from_rule(entry: object, where: str) -> Library:
+    if not isinstance(entry, dict):
+        raise CbomRuleError(f"{where}: a library rule must be a mapping")
+    for field_name in ("rule", "name", "releases"):
+        if not entry.get(field_name):
+            raise CbomRuleError(f"{where}: missing '{field_name}'")
+    if not isinstance(entry["releases"], list):
+        raise CbomRuleError(f"{where}: 'releases' must be a list")
+    releases = []
+    for i, rel in enumerate(entry["releases"]):
+        here = f"{where}.releases[{i}]"
+        if not isinstance(rel, dict) or not rel.get("algorithms"):
+            raise CbomRuleError(f"{here}: needs a non-empty 'algorithms' list")
+        algos = rel["algorithms"]
+        if not isinstance(algos, list) or not all(isinstance(a, str) for a in algos):
+            raise CbomRuleError(f"{here}: 'algorithms' must be a list of algorithm keys")
+        releases.append(Release(tuple(algos),
+                                str(rel["introduced"]) if rel.get("introduced") else None,
+                                str(rel["fixed"]) if rel.get("fixed") else None,
+                                str(rel.get("source") or "")))
+    return Library(str(entry["rule"]), str(entry["name"]), tuple(releases))
+
+
+DEFAULT_ALGOS = AlgoSet(ALGOS)
+
+
+def _algo_from_rule(entry: object, where: str) -> Algo:
+    if not isinstance(entry, dict):
+        raise CbomRuleError(f"{where}: an algorithm rule must be a mapping")
+    for field_name in ("key", "name", "primitive", "quantum", "patterns"):
+        if not entry.get(field_name):
+            raise CbomRuleError(f"{where}: missing '{field_name}'")
+    key = str(entry["key"])
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", key):
+        raise CbomRuleError(f"{where}: key '{key}' must be lower-case letters, digits, . _ -")
+    if entry["primitive"] not in PRIMITIVES:
+        raise CbomRuleError(f"{where}: primitive '{entry['primitive']}' is not one of "
+                            + ", ".join(sorted(PRIMITIVES)))
+    if entry["quantum"] not in QUANTUM_STATUSES:
+        raise CbomRuleError(f"{where}: quantum '{entry['quantum']}' is not one of "
+                            + ", ".join(sorted(QUANTUM_STATUSES)))
+    patterns = entry["patterns"]
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+        raise CbomRuleError(f"{where}: 'patterns' must be a list of regular expressions")
+    wrapped = []
+    for pat in patterns:
+        try:
+            re.compile(pat.encode("ascii"))
+        except (re.error, UnicodeEncodeError) as exc:
+            raise CbomRuleError(f"{where}: pattern {pat!r} is not a usable ASCII regex: {exc}") from exc
+        wrapped.append(pat)
+    return Algo(key, str(entry["name"]), str(entry["primitive"]), str(entry["quantum"]),
+                (_B + "(?:" + "|".join(wrapped) + ")",), str(entry.get("note") or ""))
+
+
+def load_algo_roots(roots: Sequence["RuleRoot"]) -> AlgoSet:
+    """The built-in algorithms overlaid by the ``algorithms/*.yaml`` of each rule root.
+
+    Roots load in order, so a later root replaces an earlier one's rule of the same key.
+    Each pattern is a regular expression for an identifier; the scan puts an identifier
+    boundary in front of it, so write ``mbedtls_aes_`` and not ``\\bmbedtls_aes_``.
+    """
+    import yaml
+
+    algos: List[Algo] = list(ALGOS)
+    libraries: Dict[str, Library] = {}
+    sources: List[str] = []
+    for root in roots:
+        lib_folder = root.path / LIBRARY_DIR
+        if lib_folder.is_dir():
+            count = 0
+            for path in sorted(lib_folder.glob("*.y*ml")):
+                try:
+                    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                except (OSError, yaml.YAMLError) as exc:
+                    raise CbomRuleError(f"{path}: unreadable: {exc}") from exc
+                entries = data.get("libraries") if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    raise CbomRuleError(f"{path}: expected a list under 'libraries:'")
+                for i, entry in enumerate(entries):
+                    lib = _library_from_rule(entry, f"{path}[{i}]")
+                    libraries[lib.rule] = lib        # a later root replaces an earlier one
+                    count += 1
+            if count:
+                sources.append(f"{root.label}: {count} library rule(s)")
+        folder = root.path / ALGO_DIR
+        if not folder.is_dir():
+            continue
+        added = 0
+        for path in sorted(folder.glob("*.y*ml")):
+            where = f"{path}"
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError) as exc:
+                raise CbomRuleError(f"{where}: unreadable: {exc}") from exc
+            entries = data.get("algorithms") if isinstance(data, dict) else data
+            if not isinstance(entries, list):
+                raise CbomRuleError(f"{where}: expected a list under 'algorithms:'")
+            for i, entry in enumerate(entries):
+                algos.append(_algo_from_rule(entry, f"{where}[{i}]"))
+                added += 1
+        if added:
+            sources.append(f"{root.label}: {added} algorithm rule(s)")
+    result = AlgoSet(algos, sources, libraries)
+    for lib in libraries.values():
+        for release in lib.releases:
+            unknown = [a for a in release.algorithms if a not in result.by_key]
+            if unknown:
+                raise CbomRuleError(f"library {lib.rule}: unknown algorithm key(s) "
+                                    + ", ".join(unknown))
+    return result
+
+
+def cbom_roots(given: Sequence[str] = ()) -> List["RuleRoot"]:
+    """Rule roots for a CBOM scan: the ones named, else the installed packs of kind ``cbom``."""
+    if given:
+        roots = [RuleRoot(Path(p), "--rules") for p in given]
+        for r in roots:
+            r.manifest = read_manifest(r.path)
+    else:
+        roots = default_roots(kind="cbom")
+    for r in roots:
+        check_manifest(r.path, r.manifest)
+    return roots
 
 
 @dataclass
@@ -187,13 +374,13 @@ class Occurrence:
     path: str
     line: Optional[int]
     symbol: str
-    kind: str                 # code | config | header | binary
+    kind: str                 # code | config | header | binary | library
     state: str                # linked | not-linked | unknown
     image: bool = False       # a binary hit inside a firmware image, not a library
 
 
 _STATE_RANK = {"linked": 0, "unknown": 1, "not-linked": 2}
-_KIND_RANK = {"code": 0, "binary": 1, "config": 2, "header": 3}
+_KIND_RANK = {"code": 0, "binary": 1, "library": 2, "config": 3, "header": 4}
 
 
 def _rank(occ: "Occurrence") -> Tuple[int, int]:
@@ -261,6 +448,8 @@ class Asset:
                 score = 0.85 if o.state == "linked" else 0.6
             elif o.kind == "code":
                 score = 0.9 if o.state == "linked" else 0.5
+            elif o.kind == "library":
+                score = 0.6 if o.state == "linked" else 0.4
             elif o.kind == "config":
                 score = 0.5
             else:
@@ -294,11 +483,11 @@ def _line_of(offsets: Sequence[int], pos: int) -> int:
 
 def _scan_bytes(data: bytes, path: str, kind: str, state: str,
                 assets: Dict[Tuple[str, str], Asset], with_lines: bool,
-                image: bool = False) -> None:
+                image: bool = False, algos: AlgoSet = DEFAULT_ALGOS) -> None:
     offsets: List[int] = []
     if with_lines:
         offsets = [m.start() for m in re.finditer(b"\n", data)]
-    for algo, regex in _ALGO_RE:
+    for algo, regex in algos.regexes:
         for m in regex.finditer(data):
             asset = assets.setdefault((algo.key, ""), Asset(algo))
             asset.add(Occurrence(path, _line_of(offsets, m.start()) if with_lines else None,
@@ -309,7 +498,7 @@ def _scan_bytes(data: bytes, path: str, kind: str, state: str,
         bits = m.group(1).decode()
         mode = m.group(2).decode().upper()
         label = f"AES-{bits}-{mode}"
-        asset = assets.setdefault(("aes", label), Asset(_BY_KEY["aes"], label, bits, mode))
+        asset = assets.setdefault(("aes", label), Asset(algos.by_key["aes"], label, bits, mode))
         asset.add(Occurrence(path, _line_of(offsets, m.start()) if with_lines else None,
                              m.group(0).decode("ascii", "replace")[:80], kind, state, image))
 
@@ -344,7 +533,9 @@ def _blob_state(path: Path, facts: Optional[BuildFacts]) -> str:
 
 
 def scan_cbom(root: Path, facts: Optional[BuildFacts] = None,
-              include_tests: bool = False, binaries: bool = True) -> CbomResult:
+              include_tests: bool = False, binaries: bool = True,
+              algos: AlgoSet = DEFAULT_ALGOS,
+              components: Optional[Sequence[Any]] = None) -> CbomResult:
     root = Path(root).resolve()
     assets: Dict[Tuple[str, str], Asset] = {}
     scanned = 0
@@ -376,7 +567,7 @@ def scan_cbom(root: Path, facts: Optional[BuildFacts] = None,
                     state = "unknown" if kind == "config" else _source_state(path, kind, facts)
                     if state is None:
                         continue
-                    _scan_bytes(path.read_bytes(), rel, kind, state, assets, True)
+                    _scan_bytes(path.read_bytes(), rel, kind, state, assets, True, algos=algos)
                     scanned += 1
                 elif binaries and suffix in BLOB_SUFFIXES and size <= MAX_BANNER_BYTES:
                     state = _blob_state(path, facts)
@@ -385,7 +576,7 @@ def scan_cbom(root: Path, facts: Optional[BuildFacts] = None,
                               else None)
                     is_image = suffix in IMAGE_SUFFIXES
                     for blob in ([l.data for l in layers] if layers else [data]):
-                        _scan_bytes(blob, rel, "binary", state, assets, False, is_image)
+                        _scan_bytes(blob, rel, "binary", state, assets, False, is_image, algos)
                     scanned += 1
                     if is_image and state != "not-linked":
                         images += 1
@@ -395,14 +586,54 @@ def scan_cbom(root: Path, facts: Optional[BuildFacts] = None,
         notes.append("No compile database or link map was given, so this lists what the tree "
                      "contains, not what ships: every algorithm in a crypto library's source "
                      "appears. Pass --compile-db / --link-map to count only what was built.")
+    if components is not None:
+        if not algos.libraries:
+            notes.append("--libraries needs a rule pack with libraries/*.yaml (gangmu-cbom-rules); "
+                         "none is installed, so no algorithm was derived from the libraries.")
+        else:
+            covered = add_library_assets(assets, components, algos, notes)
+            notes.append(f"Algorithms derived from {covered} identified librar"
+                         f"{'y' if covered == 1 else 'ies'} are what their source provides, "
+                         "not proof the firmware calls them (kind: library).")
+    notes.extend(f"Algorithm rules from {src}" for src in algos.sources)
     ordered = sorted(assets.values(), key=lambda a: (a.algo.key, a.variant))
     return CbomResult(str(root), ordered, facts is not None, scanned, notes, images)
+
+
+def add_library_assets(assets: Dict[Tuple[str, str], Asset], components: Iterable[Any],
+                       algos: AlgoSet, notes: List[str]) -> int:
+    """Add what the capability tables say the identified libraries provide.
+
+    A library *provides* an algorithm when its source contains it; the firmware may still
+    never call it, so these hits rank below a call site and count 0.6 at most. Returns the
+    number of components the tables covered."""
+    covered = 0
+    unversioned: List[str] = []
+    for comp in components:
+        lib = algos.libraries.get(comp.rule_id)
+        if lib is None:
+            continue
+        version = getattr(comp, "version", None)
+        keys = lib.algorithms_for(version) if version else None
+        if keys is None:
+            unversioned.append(f"{lib.name} {version or '(no version)'}".strip())
+            continue
+        covered += 1
+        state = {True: "linked", False: "not-linked", None: "unknown"}[getattr(comp, "linked", None)]
+        for key in keys:
+            algo = algos.by_key[key]
+            asset = assets.setdefault((key, ""), Asset(algo))
+            asset.add(Occurrence(comp.directory, None, f"{lib.name} {version}", "library", state))
+    if unversioned:
+        notes.append("No capability table covers: " + ", ".join(sorted(set(unversioned)))
+                     + " (version unknown, unorderable, or outside every release span).")
+    return covered
 
 
 # ------------------------------------------------------------------ output
 
 def _now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return repro.timestamp()
 
 
 def _component(asset: Asset, images: int = 0) -> Dict[str, Any]:
@@ -457,10 +688,10 @@ def to_cbom(result: CbomResult, app_name: str = "firmware",
     app: Dict[str, Any] = {"type": "firmware", "name": app_name, "bom-ref": "firmware"}
     if app_version:
         app["version"] = app_version
-    return {
+    return repro.fill_document_id({
         "bomFormat": "CycloneDX",
         "specVersion": SPEC_VERSION,
-        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+        "serialNumber": f"urn:uuid:{repro.ID_PLACEHOLDER}",
         "version": 1,
         "metadata": {
             "timestamp": _now(),
@@ -475,7 +706,7 @@ def to_cbom(result: CbomResult, app_name: str = "firmware",
         },
         "components": [_component(a, result.images) for a in result.assets],
         "dependencies": [{"ref": "firmware", "dependsOn": [a.ref for a in result.counted()]}],
-    }
+    })
 
 
 QUANTUM_LABEL = {VULNERABLE: "quantum-vulnerable", SYMMETRIC: "symmetric", PQC: "post-quantum",
@@ -506,6 +737,75 @@ def cbom_table(result: CbomResult) -> str:
                      "Look at them before dropping them.")
     lines.extend(f"note: {n}" for n in result.notes)
     return "\n".join(lines)
+
+
+# What to move to, by what the algorithm does. Standards are the NIST ones; a vendor or
+# national scheme may require another, so this is a starting point, not a mandate.
+_TARGET = {
+    "key-agree": "ML-KEM (FIPS 203), usually hybrid with X25519/ECDH during the transition",
+    "kem": "ML-KEM (FIPS 203)",
+    "pke": "ML-KEM (FIPS 203) for encryption or key transport, ML-DSA (FIPS 204) where it signs",
+    "signature": "ML-DSA (FIPS 204) or SLH-DSA (FIPS 205); LMS/XMSS (SP 800-208) for firmware signing",
+}
+
+
+def _where(a: Asset) -> str:
+    first = a.occurrences[0]
+    return first.path + (f":{first.line}" if first.line else "")
+
+
+def readiness_report(result: CbomResult) -> str:
+    """A Markdown post-quantum readiness summary: what to migrate, what is done, what to look at.
+
+    It reads the same assets as the table; nothing is added. Assets the build facts rule
+    out are listed apart, not counted."""
+    counted = result.counted()
+    out = [e for e in result.assets if e.verdict() == "not-linked"]
+    groups = [
+        ("Migrate: broken by a quantum computer", VULNERABLE, True),
+        ("Replace now: weak against classical attackers", BROKEN, False),
+        ("Already post-quantum", PQC, False),
+        ("Symmetric: keep 256-bit keys and SHA-384 or larger", SYMMETRIC, False),
+    ]
+    lines = ["# Post-quantum readiness", ""]
+    vulnerable = [a for a in counted if a.algo.quantum == VULNERABLE]
+    pqc = [a for a in counted if a.algo.quantum == PQC]
+    if vulnerable:
+        verdict = (f"{len(vulnerable)} quantum-vulnerable algorithm(s) in use; "
+                   f"{len(pqc)} post-quantum.")
+    elif pqc:
+        verdict = f"No quantum-vulnerable algorithm found; {len(pqc)} post-quantum in use."
+    else:
+        verdict = "No quantum-vulnerable algorithm found."
+    lines += [f"**{verdict}** {len(counted)} algorithm(s) counted over "
+              f"{result.files_scanned} file(s).", ""]
+    for title, quantum, with_target in groups:
+        items = [a for a in counted if a.algo.quantum == quantum]
+        if not items:
+            continue
+        lines += [f"## {title}", ""]
+        for a in sorted(items, key=lambda x: (-x.confidence(), x.name)):
+            line = f"- **{a.name}**, confidence {a.confidence():.2f}, {a.count} hit(s), first at `{_where(a)}`"
+            if with_target and a.algo.primitive in _TARGET:
+                line += f". Move to: {_TARGET[a.algo.primitive]}"
+            if a.algo.note and quantum != PQC:
+                line += f". {a.algo.note}"
+            lines.append(line)
+        lines.append("")
+    weak = [a for a in counted if a.algo.quantum == VULNERABLE and a.confidence() < 0.6]
+    if weak:
+        lines += ["## Confirm before acting", "",
+                  "These hits rest on weak evidence (a library's capability table, a "
+                  "configuration option, or code the build facts do not confirm): "
+                  + ", ".join(a.name for a in weak) + ".", ""]
+    if out:
+        lines += ["## Not part of this build", "",
+                  "Named in the sources but ruled out by the build facts: "
+                  + ", ".join(a.name for a in out) + ".", ""]
+    lines.extend(f"> note: {n}" for n in result.notes)
+    lines += ["", "Found by name, not by analysis: key sizes, protocol versions and "
+              "hand-written primitives are not inspected."]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def failing(result: CbomResult, what: Iterable[str]) -> List[Asset]:

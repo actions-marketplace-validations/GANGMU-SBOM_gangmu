@@ -16,21 +16,20 @@ primary format rather than an afterthought:
 
 from __future__ import annotations
 
-import datetime as _dt
-import uuid
 from typing import Any, Dict, List, Optional
 
 from .. import __version__
 from ..licenses import cyclonedx_licenses, differs, observed_ids
 from ..support import support_properties
 from ..model import Finding, ScanResult
+from ..core import repro
 
 SPEC_VERSION = "1.6"
 _IDENTITY_FIELD_FOR = {"purl": "purl", "cpe": "cpe"}
 
 
 def _now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return repro.timestamp()
 
 
 def _identity_entries(finding: Finding) -> List[Dict[str, Any]]:
@@ -204,9 +203,42 @@ def _binary_component(blob) -> Dict[str, Any]:
     if blob.toolchain:
         props.append({"name": "gangmu:toolchain", "value": blob.toolchain})
     for emb in blob.embedded:
-        props.append({"name": ("gangmu:vendorComponent" if emb.vendor_component
-                               else "gangmu:embeddedLibrary"),
-                      "value": f"{emb.display_name} {emb.version}".strip()})
+        if emb.method in ("imports", "dotnet-reference"):
+            props.append({"name": "gangmu:importedLibrary", "value": emb.display_name})
+        elif emb.method == "deps-json":
+            props.append({"name": "gangmu:declaredDependency",
+                          "value": f"{emb.display_name} {emb.version}".strip()})
+        elif emb.method == "dotnet-assembly":
+            props.append({"name": "gangmu:identifiedAs",
+                          "value": f"{emb.display_name} {emb.version}".strip()})
+        else:
+            props.append({"name": ("gangmu:vendorComponent" if emb.vendor_component
+                                   else "gangmu:embeddedLibrary"),
+                          "value": f"{emb.display_name} {emb.version}".strip()})
+    if blob.container:
+        props.append({"name": "gangmu:containedIn", "value": blob.container})
+        props.append({"name": "gangmu:offsetInContainer", "value": str(blob.offset)})
+    if blob.embedded_binaries:
+        props.append({"name": "gangmu:embeddedBinaries", "value": str(blob.embedded_binaries)})
+    if blob.arch and blob.container:
+        props.append({"name": "gangmu:architecture", "value": blob.arch})
+    if blob.runtime:
+        props.append({"name": "gangmu:runtime", "value": blob.runtime})
+    if blob.product:
+        name = blob.product.get("ProductName") or blob.product.get("name")
+        version = (blob.product.get("ProductVersion") or blob.product.get("FileVersion")
+                   or blob.product.get("version"))
+        if name:
+            props.append({"name": "gangmu:productName", "value": str(name)})
+        if version:
+            props.append({"name": "gangmu:productVersion", "value": str(version)})
+    if blob.pdb:
+        props.append({"name": "gangmu:pdbPath", "value": blob.pdb})
+    if blob.signed is not None:
+        props.append({"name": "gangmu:authenticodeSigned",
+                      "value": "true" if blob.signed else "false"})
+    if blob.imports:
+        props.append({"name": "gangmu:importedDlls", "value": ",".join(sorted(blob.imports)[:64])})
     return {
         "bom-ref": f"binary:{blob.path}",
         "type": "file",
@@ -235,7 +267,7 @@ def to_cyclonedx(result: ScanResult, app_name: str = "firmware",
     bom: Dict[str, Any] = {
         "bomFormat": "CycloneDX",
         "specVersion": SPEC_VERSION,
-        "serialNumber": serial or f"urn:uuid:{uuid.uuid4()}",
+        "serialNumber": serial or f"urn:uuid:{repro.ID_PLACEHOLDER}",
         "version": 1,
         "metadata": {
             "timestamp": timestamp or _now(),
@@ -271,7 +303,7 @@ def to_cyclonedx(result: ScanResult, app_name: str = "firmware",
         "components": components,
         "dependencies": dependencies,
     }
-    return bom
+    return repro.fill_document_id(bom)
 
 
 def _dependency_graph(findings, components) -> List[Dict[str, Any]]:

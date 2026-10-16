@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gangmu-sbom"
-version = "0.7.1"
+version = "0.10.0"
 description = "Build-time SBOM for embedded C/C++, with a community rule base for vendor SDK components"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,7 @@ keywords = [
     "sbom", "software-bill-of-materials", "embedded", "firmware", "c", "cpp",
     "cyclonedx", "spdx", "vex", "cyber-resilience-act", "cra",
     "software-composition-analysis", "esp-idf", "zephyr", "rt-thread",
-    "openharmony", "gmssl", "tongsuo", "guomi",
+    "openharmony", "gmssl", "tongsuo", "guomi", "cbom", "aibom", "post-quantum",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -60,3 +60,19 @@ gangmu = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Pyflakes and syntax errors: unused or undefined names, not style.
+select = ["F", "E9", "B904", "B007"]
+
+[tool.mypy]
+files = ["src"]
+
+[[tool.mypy.overrides]]
+# Optional dependency; the disasm extra is not installed everywhere.
+module = ["capstone", "capstone.*"]
+ignore_missing_imports = true

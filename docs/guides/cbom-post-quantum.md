@@ -60,6 +60,47 @@ gangmu cbom . --compile-db build/compile_commands.json \
 另外 `compile_commands.json` 列出整个构建的所有目标，不只是这个可执行文件；链接 map 只对应一个目标，同名目标文件（本次有 29 个）按保守处理为已链接。
 所以结果适合当“待核对清单”，不能直接当最终结论。
 
+## 用规则包扩充算法表
+
+内置的算法表可以被规则包补充或覆盖，不用改工具。规则包的 `rulebase.json` 写 `"kind": "cbom"`，算法放在 `algorithms/*.yaml`：
+
+```yaml
+algorithms:
+  - key: frodokem            # 与内置同名则替换，否则新增
+    name: FrodoKEM
+    primitive: kem           # CycloneDX algorithmProperties.primitive 的取值
+    quantum: pqc             # vulnerable | symmetric | pqc | broken | neutral
+    patterns: ['FrodoKEM\w*', 'PQCLEAN_FRODOKEM\w*']   # 标识符的正则，工具会自动加上标识符边界
+    note: NIST 未标准化。
+```
+
+`gangmu cbom --rules DIR`（可重复）指定目录；不指定时读取已安装的 `kind` 为 `cbom` 的规则包。`kind` 为 `sbom` 或不写的包不会被当作算法规则读取。规则有错（未知的 primitive、写不出的正则）时命令退出码为 2，并说明是哪个文件哪一条。
+
+## 从识别出的库推出算法（`--libraries`）
+
+固件常常只带了库的二进制或改过名的源码，逐文件找标识符会漏。`gangmu cbom --libraries` 先跑一遍 SBOM 扫描，认出 Mbed TLS、wolfSSL、OpenSSL 这类库和它的版本，再按规则包里的能力表列出“这个版本的源码提供哪些算法”。
+
+能力表放在规则包的 `libraries/*.yaml`：
+
+```yaml
+libraries:
+  - rule: generic/mbedtls        # 识别这个库的 SBOM 规则 id
+    name: Mbed TLS
+    releases:
+      - introduced: "2.28.0"     # 含
+        fixed: "2.29.0"          # 不含
+        algorithms: [aes, rsa, ecdsa, md5, ...]   # algorithms/*.yaml 里的 key
+        source: 版本、扫描的目录
+```
+
+这样得到的算法，证据类型是 `library`：它说明“库的源码里有”（不论默认是否启用），**不说明固件调用了它**，所以可信度最高 0.6，低于链接进来的调用点（0.9）。构建事实说这个库没编译进去时，不计入。版本认不出、排不了序、或不在任何版本段内时，命令会在提示里列出这个库，不会猜。能力表是 `gangmu-cbom-rules` 里的 `tools/derive_libraries.py` 用同一套标识符对上游标签扫描生成的，每一段只扫了写明的那个标签。
+
+## 迁移摘要（`--format readiness`）
+
+`gangmu cbom <目录> --format readiness` 输出一份 Markdown 摘要，按要做的事分组：必须迁移的量子易受攻击算法（附 NIST 的替代方案：ML-KEM、ML-DSA、SLH-DSA，固件签名可用 LMS/XMSS）、现在就该换掉的弱算法、已经是后量子的、对称算法（建议 256 位密钥）。证据弱的算法单列"先确认再动手"，被构建事实排除的单列"不属于这次构建"。
+
+它读的是同一份扫描结果，没有额外分析：只按名字识别，不看密钥长度和协议版本。给了 `--compile-db`/`--link-map` 才能区分"源码里有"和"编出来了"。替代方案是起点，不是强制要求，厂商或国家标准（如国密）可能另有规定。
+
 ## 它不做什么
 
 - **按名字识别，不按行为识别。** 自己手写、没用常见名字的算法看不到；

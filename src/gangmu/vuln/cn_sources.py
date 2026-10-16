@@ -24,7 +24,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from .model import Advisory
 
@@ -371,7 +371,7 @@ def load_cn_report(directory: Path, keep=None) -> CnLoadReport:
         name = path.name.lower()
         hint = ("cnvd" if "cnvd" in name else
                 "nvdb" if "nvdb" in name or "cstis" in name else "cnnvd")
-        seen = set()
+        seen: set = set()
         try:
             for raw_record in records:
                 if not isinstance(raw_record, dict):

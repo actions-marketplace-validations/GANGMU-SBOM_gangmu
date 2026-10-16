@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hashlib
 import json
@@ -19,6 +19,7 @@ from pathlib import Path
 from ..fingerprint import ALGO, DEFAULT_K, DEFAULT_SKETCH, DEFAULT_WINDOW, Signature
 from ..fnsig import FunctionSignature
 from ..support import Support, SupportError, parse_support
+from ..core.cpe import escape_value, join_cpe, split_cpe
 
 # Containment bands for function-level matching. A component's own functions
 # are either present in the tree or they are not, so the bands sit much higher
@@ -139,7 +140,14 @@ class VersionProbe:
             m = re.search(pattern, text)
             if not m:
                 return None
-            values[name] = m.group(1) if m.groups() else m.group(0)
+            value = m.group(1) if m.groups() else m.group(0)
+            if name.startswith("hex_"):
+                # littlefs packs 2.10 into ``0x0002000a``.
+                name, value = name[4:], str(int(value, 16))
+            elif name.startswith("dash_"):
+                # Zephyr's ``EXTRAVERSION = rc2``: ``-rc2``, or nothing when empty.
+                name, value = name[5:], f"-{value}" if value else ""
+            values[name] = value
         try:
             return self.template.format(**values)
         except KeyError:
@@ -269,10 +277,10 @@ def _splice_version(cpe: Optional[str], version: Optional[str]) -> Optional[str]
     if not cpe:
         return None
     if version and "~" not in version:
-        parts = cpe.split(":")
+        parts = split_cpe(cpe)
         if len(parts) > 5:
-            parts[5] = version
-            return ":".join(parts)
+            parts[5] = escape_value(version)
+            return join_cpe(parts)
     return cpe
 
 
@@ -494,7 +502,7 @@ def rule_from_dict(data: Mapping[str, Any], source_path: str = "") -> Rule:
     aliases = _tuple(upstream.get("cpe_aliases"))
     primary = [str(upstream["cpe"])] if upstream.get("cpe") else []
     for candidate in [*primary, *aliases]:
-        parts = str(candidate).split(":")
+        parts = split_cpe(str(candidate))
         if len(parts) != 13 or parts[0] != "cpe" or parts[1] != "2.3":
             raise RuleError(
                 f"{source_path}: every CPE must be a well-formed CPE 2.3 name "

@@ -50,18 +50,20 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from .declared import Declaration
-from .declared_linux import _known, _literal
+from .declared_linux import _known
+from .core.walk import NOT_CONTENT_DIRS
 
 ECOSYSTEM_YOCTO = "yocto"
 ECOSYSTEM_PLATFORMIO = "platformio"
 ECOSYSTEM_CONAN = "conan"
 ECOSYSTEM_BAZEL = "bazel"
 
-_SKIP = {".git", "node_modules", "__pycache__", "sstate-cache", "downloads", "work",
-         "work-shared", "cache", "buildhistory"}
+# Plus Yocto's caches and work directories: build state, not the layers' recipes.
+_SKIP = NOT_CONTENT_DIRS | {"sstate-cache", "downloads", "work", "work-shared", "cache",
+                            "buildhistory"}
 _MAX_DEPTH = 5
 
 
@@ -80,9 +82,13 @@ def _walk(root: Path, max_depth: int = _MAX_DEPTH,
 
 
 def read_build_ecosystems(root: Path) -> List[Declaration]:
+    from .declared_deps import read_dependency_files
+    from .declared_packs import read_vendor_packages
+    from .declared_rootfs import read_rootfs_packages
     root = Path(root).resolve()
     return (read_yocto(root) + read_platformio(root) + read_conan(root)
-            + read_bazel(root))
+            + read_bazel(root) + read_dependency_files(root)
+            + read_vendor_packages(root) + read_rootfs_packages(root))
 
 
 # ------------------------------------------------------------------------ Yocto
@@ -440,7 +446,7 @@ def _starlark_calls(path: Path):
         return
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            kwargs = {}
+            kwargs: Dict[str, Any] = {}
             for kw in node.keywords:
                 if kw.arg is None:
                     continue
@@ -482,7 +488,7 @@ def read_bazel(root: Path) -> List[Declaration]:
             if fname not in files:
                 continue
             source = (here / fname).relative_to(root).as_posix()
-            overrides: Dict[str, dict] = {}
+            overrides: Dict[str, tuple] = {}
             calls = list(_starlark_calls(here / fname) or [])
             for func, kw in calls:
                 if func in ("single_version_override", "git_override") and kw.get("module_name"):

@@ -25,7 +25,7 @@ import lzma
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Sequence, Tuple
 
 KEV_URL = ("https://www.cisa.gov/sites/default/files/feeds/"
            "known_exploited_vulnerabilities.json")
@@ -119,8 +119,8 @@ def fetch_threat(db: Path, get: ByteGetter = _http_bytes,
     if not n:
         raise ValueError("the EPSS feed held no scores")
     buf = io.BytesIO()
-    with lzma.open(buf, "wt", encoding="utf-8") as fh:
-        fh.write(text)
+    with lzma.open(buf, "wb") as fh:
+        fh.write(text.encode("utf-8"))
     _replace(base / EPSS_FILE, buf.getvalue())
     log(f"EPSS: {n} scores")
     return len(rows), n

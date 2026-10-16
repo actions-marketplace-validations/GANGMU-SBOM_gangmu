@@ -4,7 +4,7 @@
 
 识别被芯片原厂改名、魔改、静态链接后的开源组件（包括国产芯片 SDK 与国密库），
 生成 CycloneDX / SPDX 软件物料清单和 VEX，对照欧盟《网络弹性法案》（CRA）自查，
-并起草 CRA 与工信部的漏洞报送材料。
+并起草 CRA 与工信部的漏洞报送材料。同一套引擎还能列出固件里的密码算法（CBOM，附后量子迁移摘要）和机器学习模型（AIBOM）。
 
 [![ci](https://github.com/GANGMU-SBOM/gangmu/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GANGMU-SBOM/gangmu/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/gangmu-sbom.svg)](https://pypi.org/project/gangmu-sbom/)
@@ -14,7 +14,7 @@
 [![CycloneDX 1.6](https://img.shields.io/badge/CycloneDX-1.6-green.svg)](https://cyclonedx.org/)
 [![SPDX 2.3](https://img.shields.io/badge/SPDX-2.3-green.svg)](https://spdx.dev/)
 
-[English](README.en.md) · [规则库 gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules) · [评测 gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench) · [常见问题](docs/FAQ.md) · [术语表](docs/GLOSSARY.md) · [规则格式](docs/RULE-FORMAT.md) · [评测基准](docs/BENCHMARK.md) · [CRA 对标](docs/CRA.md) · [国内合规](docs/CHINA.md) · [示例产物](examples/output/) · [与同类工具对比](docs/COMPARE.md)
+[English](README.en.md) · [规则库 gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules) · [评测 gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench) · [常见问题](docs/FAQ.md) · [术语表](docs/GLOSSARY.md) · [规则格式](docs/RULE-FORMAT.md) · [评测基准](docs/BENCHMARK.md) · [CRA 对标](docs/CRA.md) · [国内合规](docs/CHINA.md) · [示例产物](examples/output/) · [与同类工具对比](docs/COMPARE.md) · [密码清单 CBOM](docs/guides/cbom-post-quantum.md) · [AI 清单 AIBOM](docs/guides/aibom.md) · [策略检查](docs/guides/policy.md)
 
 > **名称由来**：「纲目」取自李时珍《本草纲目》。那部书把近两千种药物按「纲」分部、按「目」列种，
 > 每一味都写明出处、形态与性味，后世才能辨认、比对、追溯。
@@ -162,10 +162,21 @@ GitHub Action 已上架 [GitHub Marketplace](https://github.com/marketplace/acti
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/GANGMU-SBOM/gangmu
-  rev: v0.7.1
+  rev: v0.10.0
   hooks:
     - id: gangmu-scan
 ```
+
+上面这个 Action 只生成 SBOM。要在一步里同时出 SBOM、CBOM 和后量子迁移摘要，并在命中量子易受攻击算法时让 job 失败，用 [gangmu-action](https://github.com/GANGMU-SBOM/gangmu-action)：
+
+```yaml
+- uses: GANGMU-SBOM/gangmu-action@main
+  with:
+    compile-db: build/compile_commands.json
+    fail-on: quantum-vulnerable
+```
+
+迁移摘要需要 gangmu 0.9 及以上。
 
 ### 漏洞比对与合规
 
@@ -198,7 +209,11 @@ gangmu report CVE-2027-12345 --regime cn-miit --vex vex.json \
 ```bash
 gangmu cbom . --compile-db build/compile_commands.json --link-map build/fw.map   # 把构建出的 .elf 放进目录，会和镜像交叉核对
 gangmu cbom . --compile-db build/compile_commands.json --format cyclonedx -o cbom.json --fail-on quantum-vulnerable
+gangmu cbom . --compile-db build/compile_commands.json --format readiness -o pqc-readiness.md   # 后量子迁移摘要（Markdown）
+gangmu cbom . --libraries                                # 再按认出的库和版本补上它们提供的算法（置信度不超过 0.6）
 ```
+
+`--format readiness` 和 `--libraries` 从 0.9 起可用。摘要把算法分成「必须迁移 / 现在就换 / 已是后量子 / 对称」，量子易受攻击的附 NIST 的替代方案。
 
 在 Mbed TLS（本机 gcc 构建 `ssl_client1`）上的一次实际输出，节选（不是准确率，局限见[指南](docs/guides/cbom-post-quantum.md)）：
 
@@ -213,14 +228,34 @@ ML-KEM (Kyber)      post-quantum        not-linked  no     0.20  78    tf-psa-cr
 
 只给源码树时 42 项，加编译数据库和链接 map 后 39 项；ML-KEM、ML-DSA 在树里但没编译，被标 `not-linked`。`IMAGE = no` 的意思是“值得去看”，不是“固件里没有”。
 
+算法表本身是数据，可以用规则包补充或覆盖：[gangmu-cbom-rules](https://github.com/GANGMU-SBOM/gangmu-cbom-rules) 放着内置算法表的导出、几个尚无最终标准的后量子候选，以及 Mbed TLS、wolfSSL、OpenSSL、铜锁、GmSSL 的「库版本 → 提供的算法」能力表（这些表由脚本从上游标签生成）。该包还没有发布到 PyPI，目前 `git clone` 后用 `gangmu cbom . --rules gangmu-cbom-rules/rules` 指向它。
+
+### AI 清单（AIBOM）
+
+```bash
+gangmu aibom .                                   # 表格
+gangmu aibom . --format cyclonedx -o aibom.json  # CycloneDX 1.6
+```
+
+列出目录里的机器学习模型（TFLite、GGUF、ExecuTorch、ONNX、safetensors、PyTorch 等，按文件头或扩展名认，带 SHA-256；编进 C 数组的 TFLite 模型也认）和推理运行时（TFLite Micro、CMSIS-NN、Edge Impulse、ONNX Runtime、llama.cpp 等）。训练数据、许可证和用途读不出来，由人写进目录根的 `gangmu-aibom.yaml`，工具并进输出（标为人工声明，不核对），`--require-declarations` 可在 CI 里卡住没写清楚的模型；还没接编译数据库，源码里提到的运行时不一定编进了固件。识别表可以用规则包扩充（`--rules`，[gangmu-aibom-rules](https://github.com/GANGMU-SBOM/gangmu-aibom-rules)）。见 [AIBOM 指南](docs/guides/aibom.md)。
+
+### 策略检查
+
+```bash
+gangmu policy check firmware/ --policy path/to/policy-pack
+gangmu policy check firmware/ --format markdown --fail-on deprecated -o policy.md
+```
+
+把 CBOM 和 AIBOM 对照写成数据的策略（`policies/*.yaml`，带出处和 `deprecated-after` / `disallowed-after` 日期），每条检查给出 `ok`、`due`（还没到期，是迁移清单）、`deprecated`、`fail`，可按 `--as-of` 判断，`--fail-on` 作 CI 闸门。不下法律结论，也不看密钥长度。见[策略检查指南](docs/guides/policy.md)。维护好的法规策略包（NIST IR 8547 等）在商业版的 gangmu-policy-pro；格式和引擎开源。
+
 ## 能识别什么
 
 | 类别 | 例子 | 怎么认 |
 | --- | --- | --- |
 | 通用开源组件 | lwIP、Mbed TLS、FreeRTOS、RT-Thread、LVGL、OpenSSL、littlefs、FatFs、libcoap、nghttp2 等 | 目录定位 + 函数级指纹，版本来自「这些函数属于哪几个发布版」 |
 | 国密库 | GmSSL 2.x / 3.x、铜锁 Tongsuo | 逐版本锚点 + 多版本函数签名 + 版本探针；与 OpenSSL 互相做代码分割，不会互相误认 |
-| 包管理器与生态声明 | RT-Thread、OpenHarmony、Yocto、Buildroot / OpenWrt、PlatformIO、Conan、Bazel、Zephyr `module.yml` | 直接读声明，声明与代码不一致时以代码为准，并把分歧写进证据 |
-| Zephyr 及其 HAL | Mbed TLS、hostap、MCUboot、nanopb，以及博流、沁恒、思澈、泰凌微、瑞昱、兆易的 HAL | 从 Zephyr 的锁定提交直接生成规则 |
+| 包管理器与生态声明 | RT-Thread、OpenHarmony、Yocto、Buildroot / OpenWrt、PlatformIO、Conan、Bazel、CMake（FetchContent / ExternalProject / CPM）、vcpkg、Meson wrap、Cargo `*-sys`、STM32Cube / CMSIS-Pack、dpkg / opkg / apk 包数据库、Zephyr `module.yml` | 直接读声明，声明与代码不一致时以代码为准，并把分歧写进证据 |
+| Zephyr 及其 HAL | Mbed TLS、hostap、MCUboot、nanopb，以及博流、沁恒、思澈、泰凌微、瑞昱、兆易、STM32、NXP、Nordic、TI、Renesas、Silicon Labs、Infineon 的 HAL 模块 | 从 Zephyr 的锁定提交直接生成规则 |
 | 国产 SDK 里的内核与第三方库 | FreeRTOS / RT-Thread / LiteOS / TencentOS-tiny / AliOS Things 内核，FreeType、Opus 等 | 标志文件定位，不依赖目录名 |
 
 各家国产生态具体覆盖了什么、没覆盖什么，见 [docs/CHINA.md](docs/CHINA.md)；每个版本新增了什么，见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
@@ -262,7 +297,7 @@ ok   generic/gmssl
 对不上就直接拒绝，并给出差异。第一条 cJSON 规则就是这样被拦下的：
 用仓库 HEAD 取指纹却声称是 v1.7.19，相似度 0.9922，期望 1.0。
 
-**规则库不猜 CPE。** 免费规则库 60 条里有 29 条带 CPE。新加的 CPE 都附有 NVD 里的 CVE 作为证据（`cpe_evidence`）。另外 31 条没有 CPE，每条都写明原因，多数是在完整的 NVD 镜像里确实查无记录。
+**规则库不猜 CPE。** 免费规则库 98 条里有 53 条带 CPE。新加的 CPE 都附有 NVD 里的 CVE 作为证据（`cpe_evidence`）。另外 45 条没有 CPE，每条都写明原因，多数是在完整的 NVD 镜像里确实查无记录。
 写错一个字的 CPE 匹配不到任何 CVE，SBOM 看起来却是干净的，这是规则出错最昂贵的方式。
 所以 PURL / OSV 是一等通道，不是兜底。
 
@@ -270,9 +305,9 @@ ok   generic/gmssl
 
 | 来源 | 组件 |
 | --- | --- |
-| 通用 | lwIP、cJSON、OpenSSL、GmSSL（3.x 与 2.x）、铜锁、FreeRTOS 内核、RT-Thread 内核、TencentOS-tiny 内核、AliOS Things 内核、LiteOS-M / LiteOS-A / LiteOS 5.x 内核、Mbed TLS、TF-PSA-Crypto、FatFs、littlefs、LVGL、libcoap、TinyCrypt、nghttp2、libwebsockets、Paho MQTT C、OpenThread、AWS IoT Device SDK |
-| Zephyr | Mbed TLS 4.1、TF-PSA-Crypto、hostap、FatFs、littlefs、MCUboot、nanopb、zcbor、uOSCORE/uEDHOC |
-| 国产与亚太芯片 HAL | 兆易、博流、沁恒、思澈、泰凌微、瑞昱 |
+| 通用 | lwIP、cJSON、OpenSSL、GmSSL（3.x 与 2.x）、铜锁、FreeRTOS 内核、RT-Thread 内核、TencentOS-tiny 内核、AliOS Things 内核、LiteOS-M / LiteOS-A / LiteOS 5.x 内核、Mbed TLS、TF-PSA-Crypto、FatFs、littlefs、LVGL、libcoap、TinyCrypt、nghttp2、libwebsockets、Paho MQTT C、OpenThread、AWS IoT Device SDK、wolfSSL、zlib、libpng、curl、Expat、LZ4、Lua、ThreadX、WAMR、coreMQTT、TinyUSB、MCUboot、micro-ecc 等（完整列表：`gangmu rules lint`） |
+| Zephyr | Mbed TLS 4.1、TF-PSA-Crypto、hostap、FatFs、littlefs、MCUboot、nanopb、zcbor、uOSCORE/uEDHOC，以及 Zephyr 分发的各家 HAL 模块 |
+| 国产与亚太芯片 HAL（Zephyr 分发的） | 兆易、博流、沁恒、思澈、泰凌微、瑞昱 |
 
 覆盖的国产厂商与项目（含商业版规则包；规则或 SDK 识别至少有一项，覆盖深度各不相同）：
 
@@ -306,7 +341,7 @@ ok   generic/gmssl
 
 坦白列出来，因为缺口就是路线图。最主要的几条：
 
-- **不做深度二进制分析**：没有源码也没有构建时，只做清单、版本横幅和函数边界等较低置信度的补充证据；
+- **不做深度二进制分析**：没有源码也没有构建时，只做清单、版本横幅和函数边界等较低置信度的补充证据；对 `.exe`/`.dll` 另外读 PE 结构、Go 和 Rust 工具链写进文件的依赖清单、.NET 的元数据和 `deps.json`，各类证据的可信度和验证方法见 [docs/BINARY-SBOM.md](docs/BINARY-SBOM.md)；
 - **评测规模有限**：方法是对的，规模还不是；规则也还少，欢迎一起补；
 - **`gangmu vuln` 本身不联网**：联网的一步单独做成 `gangmu vuln-fetch`，方便在内网使用；
 - **编译器包装器只能拦截按名字查找的编译器**。
@@ -333,9 +368,9 @@ ONEKEY、Finite State、Cybellum、NetRise 面向大型企业做固件二进制�
 | `gangmu scan ROOT` | 识别组件，输出 `cyclonedx` / `spdx`（2.3） / `spdx3`（3.0.1） / `json` / `table`；`--support FILE` 写入每个组件的维护状态与停止支持日期 |
 | `gangmu wrap -- make` | 以编译器垫片运行构建，生成编译数据库 |
 | `gangmu vuln-fetch --db DIR` | 联网填充漏洞库目录：`--sbom` 只拉相关产品（秒级），`--all` 全量 NVD（按年分片，之后增量）；`--threat` 另外下载 CISA KEV 和 EPSS 到 `DIR/threat/`，`gangmu vuln` 会据此按「已被利用 → EPSS → CVSS」排序，`--fail-on kev` 遇到已被利用的漏洞就失败（Article 14 的 24 小时报送由「已被积极利用」触发） |
-| `gangmu vuln SBOM --db DIR --source ROOT` | 函数级可达性：按每条 CVE 的漏洞函数（`--symbols FILE` 给出；没有就从公告文字里猜）判断它在你的源码里是「不存在 / 已定义但无人引用 / 可达」。调用图按名字、宏、函数指针表做保守的过近似，看不到二进制库和汇编，所以默认只标注；加 `--reachability-vex` 才把不存在/不可达的写成 `not_affected`（`code_not_present` / `code_not_reachable`） |
+| `gangmu vuln SBOM --db DIR --source ROOT` | 函数级可达性：按每条 CVE 的漏洞函数（`--symbols FILE` 给出；没有就从公告文字里猜）判断它在你的源码里是「不存在 / 已定义但无人引用 / 可达」。调用图按名字、宏、函数指针表做保守的过近似，看不到二进制库和汇编，所以默认只标注（`--config`/`-D` 给出构建配置后，`#if` 排除的分支不算，只存在于被排除分支的函数判为不存在）；加 `--reachability-vex` 才把不存在/不可达的写成 `not_affected`（`code_not_present` / `code_not_reachable`） |
 | `gangmu patch-build CVE --db DIR -o patches.json`；`gangmu vuln SBOM --db DIR --source ROOT --patches patches.json` | 补丁存在性检测：用修复提交改动过的函数（修复前、修复后各记一份函数体哈希；提交号可从 OSV 记录里读，或用 `--repo URL --fix SHA` 指定）去测你源码里的那个目录——有修复后的函数体就写成 `resolved`，仍是修复前的函数体就确认为 `exploitable`，被厂商改过的函数体（既不是修复前也不是修复后）留给人判断。魔改的 fork 只报告它所基于的版本号，版本区间匹配会让它永远停在 `in_triage`；这一项直接看代码，不看版本 |
-| `gangmu rules index DIR` | 预编译规则目录，写出 `DIR/.rule-index.json`，加载时不再解析 YAML（规则越多越明显：125 条规则加载 0.67 秒 → 0.02 秒）。每条按文件哈希校验，规则改了或索引过期只会变慢，不会读错；规则包在打包时运行一次 |
+| `gangmu rules index DIR` | 预编译规则目录，写出 `DIR/.rule-index.json`，加载时不再解析 YAML（规则越多越明显：98 条规则加载约 0.6 秒 → 0.04 秒）。每条按文件哈希校验，规则改了或索引过期只会变慢，不会读错；规则包在打包时运行一次 |
 | `gangmu keygen` / `gangmu sign FILE --key K` / `gangmu sign-verify FILE --pubkey P` | 给 SBOM 或证据包的 `manifest.json` 做 Ed25519 分离签名并校验（`pip install gangmu-sbom[sign]`；密钥是标准 PEM，OpenSSL 可直接验）。只证明“这把密钥签过”，不含时间戳和密钥托管；要时间戳或免密钥签名，对同一文件用 `cosign sign-blob` |
 | `gangmu vuln SBOM --db DIR` | 漏洞比对，输出 CycloneDX VEX；`--format openvex` / `--format csaf`（须加 `--publisher`）输出 OpenVEX 0.2.0 或 CSAF 2.0 VEX |
 | `gangmu cn-db-check DIR` | 检查 CNNVD / CNVD 导出目录：每个文件能读出多少条，读不了的明确报出来 |
@@ -345,20 +380,28 @@ ONEKEY、Finite State、Cybellum、NetRise 面向大型企业做固件二进制�
 | `gangmu rules lint / import [--recursive] / fingerprint / verify / functions` | 规则校验、导入、生成、复现、函数签名。`--rules` 可重复，后面的目录覆盖前面同名的规则；不写则用已安装的规则包 |
 | `gangmu rules cpe-evidence --nvd DIR` | 从本地 NVD 镜像里找出组件登记用的 CPE，并列出引用其上游仓库的 CVE 作为证据 |
 | `gangmu perf [--check BASELINE]` | 性能基线：规则数与耗时、内存，CI 回归检查 |
-| `gangmu cbom ROOT [--compile-db F] [--link-map F]` | 密码物料清单：列出源码、配置、预编译库和固件镜像里的密码算法，输出 CycloneDX 1.6 CBOM（`--format cyclonedx`）；有构建事实时只统计真正编进固件的，没有时每项标 `unverified`；每个算法标量子风险（RSA、ECDSA、ECDH、SM2 等会被破解），`--fail-on quantum-vulnerable` 可在 CI 里卡住。按名字识别，见 [CBOM 指南](docs/guides/cbom-post-quantum.md) |
-| `gangmu sbom-score` / `eval` / `bench` / `diff` | 质量评分、评测基准、性能、召回率对比 |
+| `gangmu cbom ROOT [--compile-db F] [--link-map F] [--rules DIR] [--libraries]` | 密码物料清单：列出源码、配置、预编译库和固件镜像里的密码算法，输出 CycloneDX 1.6 CBOM（`--format cyclonedx`）或后量子迁移摘要（`--format readiness`）；`--rules` 加载 CBOM 规则包，`--libraries` 按认出的库版本补算法；有构建事实时只统计真正编进固件的，没有时每项标 `unverified`；每个算法标量子风险（RSA、ECDSA、ECDH、SM2 等会被破解），`--fail-on quantum-vulnerable`（或 `legacy`）可在 CI 里卡住。按名字识别，见 [CBOM 指南](docs/guides/cbom-post-quantum.md) |
+| `gangmu aibom ROOT [--format cyclonedx] [--rules DIR] [--declarations FILE] [--require-declarations]` | AI 物料清单：列出目录里的机器学习模型（TFLite、GGUF、ONNX、safetensors、PyTorch 等，带 SHA-256；编进 C 数组的 TFLite 模型也认）和推理运行时（TFLite Micro、CMSIS-NN、Edge Impulse、llama.cpp 等），输出 CycloneDX 1.6。训练数据和许可证读声明文件 `gangmu-aibom.yaml`（人工声明，不核对），`--rules` 加载 AIBOM 规则包，见 [AIBOM 指南](docs/guides/aibom.md) |
+| `gangmu policy check ROOT [--policy DIR] [--as-of DATE] [--fail-on fail]` | 把 CBOM、AIBOM 对照策略包里的法规或内部要求，每条检查给出 `ok` / `due` / `deprecated` / `fail` 和下一个期限；输出表格、Markdown、JSON，见 [策略检查指南](docs/guides/policy.md) |
+| `gangmu merge FILE... [-o OUT] [--fail-on-disagreement]` | 合并多份 CycloneDX（本工具的扫描、供应商的、Yocto 或 Conan 的）：purl 或名称加版本相同的算同一个，第一份优先，版本分歧与 VEX 状态冲突会报出来 |
+| `gangmu license-check SBOM [--fail-on copyleft\|incompatible\|unlicensed]` | 对 CycloneDX 里的许可证做分诊：GPL/LGPL/AGPL 等 copyleft、按 FSF 许可证列表可能不兼容的组合（如 Apache-2.0 与 GPL-2.0-only）、没有许可证的组件和预编译二进制；只是提示，不是法律结论 |
+| `gangmu binary-eval` / `binary-functions` | 二进制识别：`binary-eval` 在一批真实固件构建上给库与版本识别打分；`binary-functions` 从固件镜像还原函数边界（需要 capstone，即 `pip install gangmu-sbom[disasm]`）。见 [BINARY-VALIDATION.md](docs/BINARY-VALIDATION.md) |
+| `gangmu sbom-score` / `eval` / `bench` / `diff` | 质量评分、评测基准、性能、两份 CycloneDX 的差异对比 |
 
 ## 仓库
 
-纲目由三个公开仓库组成，各自独立发版：
+纲目由下面这些公开仓库组成，各自独立发版（`gangmu-sbom` 与 `gangmu-rules` 在 PyPI 上；`gangmu-cbom-rules`、`gangmu-aibom-rules`、`gangmu-action` 目前从 GitHub 获取）：
 
 | 仓库 | 内容 | 许可证 |
 | --- | --- | --- |
 | **[gangmu](https://github.com/GANGMU-SBOM/gangmu)**（本仓库） | 识别引擎、命令行、构建期采集、SBOM 与 VEX 输出、漏洞比对、CRA 与工信部报送草稿 | Apache-2.0 |
 | **[gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules)** | 免费规则库：被各家 SDK 拷贝最多的通用开源组件、Zephyr 及其 HAL，按日期发版，`pip install -U gangmu-rules` | CDLA-Permissive-2.0 |
 | **[gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench)** | 评测基准：固定的真实上游版本和正确答案，加评分脚本，任何人都能复现 | Apache-2.0 |
+| **[gangmu-cbom-rules](https://github.com/GANGMU-SBOM/gangmu-cbom-rules)** | CBOM 规则：算法表和库能力表，`gangmu cbom --rules` 加载；尚未发布到 PyPI | CDLA-Permissive-2.0（规则），Apache-2.0（打包代码） |
+| **[gangmu-action](https://github.com/GANGMU-SBOM/gangmu-action)** | GitHub Action：一步出 SBOM、CBOM 和后量子迁移摘要，可按算法让 job 失败 | Apache-2.0 |
+| **[gangmu-aibom-rules](https://github.com/GANGMU-SBOM/gangmu-aibom-rules)** | 免费的 AIBOM 规则库：`gangmu aibom` 认的模型格式和推理库，规则包形式，尚未发布到 PyPI | CDLA-Permissive-2.0（规则），Apache-2.0（打包代码） |
 
-商业版（规则包、持续监测、报送工作台等）不在这些仓库里，见 [docs/EDITIONS.md](docs/EDITIONS.md)。
+商业版放在私有仓库里，不在上面这些公开仓库中：按公司分包的商业版规则包（gangmu-rules-pro，规则 id 与免费库一致，装上后自动叠加）、合规策略包（gangmu-policy-pro）、授权校验与企业服务（gangmu-enterprise）。对比见 [docs/EDITIONS.md](docs/EDITIONS.md)。
 
 `pip install gangmu-sbom` 会自动装上 gangmu-rules。问题提到哪里：
 识别错了或缺某个 SDK 的规则，提到 gangmu-rules；扫描崩溃、命令行或输出格式的问题，提到本仓库；
@@ -398,6 +441,7 @@ ONEKEY、Finite State、Cybellum、NetRise 面向大型企业做固件二进制�
 - 规则（[gangmu-rules](https://github.com/GANGMU-SBOM/gangmu-rules)）：CDLA-Permissive-2.0
 - 商业版规则包：专有，见 [docs/EDITIONS.md](docs/EDITIONS.md)
 - 评测（[gangmu-bench](https://github.com/GANGMU-SBOM/gangmu-bench)）：Apache-2.0
+- CBOM 规则（[gangmu-cbom-rules](https://github.com/GANGMU-SBOM/gangmu-cbom-rules)）：规则数据 CDLA-Permissive-2.0，打包代码 Apache-2.0；GitHub Action（[gangmu-action](https://github.com/GANGMU-SBOM/gangmu-action)）：Apache-2.0
 
 ## 开发
 

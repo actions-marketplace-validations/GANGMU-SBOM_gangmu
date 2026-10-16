@@ -114,3 +114,55 @@ def test_init_reports_an_unwritable_target_without_a_traceback(tmp_path, capsys)
     blocker.write_text("not a directory")
     assert main(["init", str(blocker / "project")]) == 1
     assert "cannot write" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("with_build", [False, True])
+def test_esp_idf_managed_components_are_scanned(project_dir, rules_dir, tmp_path, with_build):
+    # The ESP-IDF component manager downloads registry dependencies into
+    # managed_components/; that is shipped code, not a build output.
+    import shutil
+    tree = tmp_path / "proj"
+    shutil.copytree(project_dir, tree)
+    managed = tree / "managed_components" / "acme__tinynet"
+    managed.parent.mkdir()
+    shutil.move(str(tree / "components" / "net" / "tinynet"), str(managed))
+    args = ["scan", str(tree), "--rules", str(rules_dir), "--format", "cyclonedx",
+            "-o", str(tmp_path / "bom.json")]
+    if with_build:
+        db = [{"directory": str(tree), "file": str(p), "command": f"cc -c {p}"}
+              for p in sorted(tree.rglob("*.c"))]
+        (tmp_path / "cc.json").write_text(json.dumps(db))
+        args += ["--compile-db", str(tmp_path / "cc.json")]
+    assert main(args) == 0
+    bom = json.loads((tmp_path / "bom.json").read_text())
+    assert any(c["name"] == "tinynet" for c in bom["components"])
+
+
+def _subcommand_paths(parser, prefix=()):
+    import argparse
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, sub in action.choices.items():
+                yield prefix + (name,)
+                yield from _subcommand_paths(sub, prefix + (name,))
+
+
+def test_every_subcommand_builds_its_help_and_has_a_handler(capsys):
+    # cli.py was split into gangmu/commands/; a handler that lost an import
+    # would only fail when that command runs.
+    from gangmu.cli import build_parser
+    parser = build_parser()
+    paths = list(_subcommand_paths(parser))
+    assert len(paths) > 30
+    for path in paths:
+        with pytest.raises(SystemExit) as done:
+            parser.parse_args([*path, "--help"])
+        assert done.value.code == 0, path
+
+
+def test_moved_helpers_are_still_importable_from_gangmu_cli():
+    # Plug-ins (gangmu.commands entry point) may import these from gangmu.cli.
+    from gangmu import cli
+    for name in ("_load_rulebase", "_write", "_table", "_rule_roots", "_resolve_jobs",
+                 "cmd_vuln", "cmd_cbom", "cmd_eval", "cmd_rules_lint", "build_parser"):
+        assert callable(getattr(cli, name)), name

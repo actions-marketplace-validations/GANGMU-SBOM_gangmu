@@ -23,20 +23,21 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .build.facts import BuildFacts
-from .dirprint import DEFAULT_INCLUDE
-from .globbing import matches_suffix
+from .core.globbing import matches_suffix
 from .manifest import MANIFEST_NAMES, ZEPHYR_MODULE
 from .rules.loader import RuleBase
+from .core.walk import NOT_CONTENT_DIRS
 
 LICENSE_MARKERS = {
     "LICENSE", "LICENSE.txt", "LICENSE.md", "LICENCE", "LICENCE.txt",
     "COPYING", "COPYING.txt", "COPYRIGHT", "NOTICE",
 }
-SKIP_DIRS = {".git", ".github", "build", "out", "node_modules", "__pycache__",
-             ".venv", "venv", "managed_components"}
+# Not ``managed_components``: ESP-IDF's component manager puts every registry
+# dependency there, and that code is compiled into the firmware like any other.
+SKIP_DIRS = NOT_CONTENT_DIRS | {".github", "build", "out"}
 SOURCE_SUFFIXES = {".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hxx", ".s", ".S"}
 
 _SUBMODULE_PATH = re.compile(r"^\s*path\s*=\s*(.+?)\s*$", re.M)

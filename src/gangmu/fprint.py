@@ -36,7 +36,7 @@ import hashlib
 import json
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, cast
 
 from . import disasm, xtensa
 from .binsig import MIN_LEN, _wanted
@@ -50,6 +50,9 @@ MIN_COVERAGE = 0.12       # share of the best release's fingerprintable function
 #                         unrelated library through in 1920 negative pairs on RISC-V)
 TIE_SHARE = 0.85         # releases scoring within this share of the best are reported as a span
 #                         (0.95 asserted a wrong release in 3 of 48 real builds, 0.85 in none)
+CONTRA_FULL = 4.0         # features at which a matched print counts in full as evidence
+CONTRA_SPAN = 2.0         # weighted contradictions a release may trail the best by and stay in the span
+UNKNOWN_STRINGS = 0xFFFF             # log-likelihood a release may trail the best and still be in the span
 UNKNOWN_STRINGS = 0xFFFF  # a sidecar made before features told strings from constants
 MAX_DF = 40               # a feature in more reference functions than this says nothing
 MAX_STRING = 512
@@ -171,6 +174,7 @@ def function_features(mem: Memory, arch: str, address: int, size: int) -> "Featu
     if arch == "xtensa":
         xtensa.features(code, address, mem.read, emit)
         return out
+    assert spec is not None     # only xtensa has none, and it returned above
     md = disasm.capstone.Cs(spec.cs_arch, spec.cs_mode)
     md.detail = True
     md.skipdata = True
@@ -233,7 +237,7 @@ def function_features(mem: Memory, arch: str, address: int, size: int) -> "Featu
                 building[ops[0].reg] = ((building[ops[0].reg] & ~(0xFFFF << shift))
                                         | (ops[1].imm & 0xFFFF) << shift)
                 continue
-            for reg, value in building.items():
+            for _reg, value in building.items():
                 emit(value)
             building.clear()
             if m == "adrp" and len(ops) == 2:
@@ -300,7 +304,7 @@ def image_features(data: bytes, arch: Optional[str] = None, base: Optional[int] 
         mem = Memory([(start, data)] if start is not None else [])
     if rec is None or not rec.functions or not mem.regions:
         return [], None
-    found = []
+    found: List[Set[int]] = []
     for f in rec.functions:
         feats = function_features(mem, rec.arch, f.address, f.size)
         if len(feats) >= (MIN_FEATURES if min_features is None else min_features):
@@ -438,19 +442,22 @@ class FunctionPrints:
               ) -> Optional[Tuple[str, int, int, float, str]]:
         """(best version, matched, of, coverage, tied range or ""), or None.
 
+        Releases are scored by contradiction (see :meth:`_contradiction`). Passing
+        *tie_share* selects the older score, the share of matched functions a release
+        explains, with releases within that share of the best reported as the span.
+
         *arch*: what the image was decoded as. When it differs from what the references were
         built for, only string literals are compared: the constants a compiler derives
         differ between architectures, and on a Cortex-M3 reference against rv32imac and
         AArch64 images they were the source of every wrong release
         (docs/BINARY-VALIDATION.md). Fewer functions are recognised, none wrongly."""
         floor = MIN_FEATURES if min_features is None else min_features
-        share = TIE_SHARE if tie_share is None else tie_share
         by_string = bool(arch and self.arch and arch != self.arch and self.knows_strings())
         index = self.index(by_string)
         matched: Set[int] = set()
         for feats in image:
             if by_string:
-                feats = getattr(feats, "strings", None) or ()
+                feats = cast(Set[int], getattr(feats, "strings", None) or set())
                 if len(feats) < floor:
                     continue
             votes: Dict[int, int] = {}
@@ -463,20 +470,60 @@ class FunctionPrints:
                     matched.add(i)
         if len(matched) < MIN_MATCHES:
             return None
+        if tie_share is None:
+            return self._contradiction(matched, by_string, floor)
         scores, owns = [], []
         for v in range(len(self.versions)):
             own = {i for i, (bits, _) in enumerate(self.functions)
                    if bits >> v & 1 and (not by_string or self.strings[i] >= floor)}
             owns.append(own)
             union = len(own | matched)
-            scores.append(len(own & matched) / union if union else 0.0)
+            # How much of what matched this release explains, not how closely the two sets
+            # agree: firmware links only part of a library (--gc-sections), so a release
+            # with more functions than the image holds must not lose to a smaller one.
+            # Releases that explain everything tie and are reported as a span. Jaccard
+            # only separates scores that are otherwise equal.
+            explained = len(own & matched) / len(matched)
+            scores.append(explained + 1e-3 * (len(own & matched) / union if union else 0.0))
         best = max(scores)
         index_best = scores.index(best)
         own = owns[index_best]
         coverage = len(own & matched) / len(own) if own else 0.0
-        if coverage < MIN_COVERAGE:
+        if coverage < MIN_COVERAGE or len(own & matched) < MIN_MATCHES:
             return None
-        tied = [i for i, s in enumerate(scores) if s >= best * share]
+        tied = [i for i, s in enumerate(scores) if s >= best * tie_share]
+        low, high = self.versions[min(tied)], self.versions[max(tied)]
+        return (self.versions[index_best], len(own & matched), len(own), coverage,
+                "" if low == high else f"{low}~{high}")
+
+    def _contradiction(self, matched: Set[int], by_string: bool, floor: int):
+        """Release scores by the weighted count of matched prints the release lacks.
+
+        The share-explained score treats the 3rd contradiction among 20 matches like the
+        30th among 200 and counts a two-feature print, which is a subset of many unrelated
+        functions, as much as a fifty-feature one. Here each matched print the release
+        does not contain costs its weight (CONTRA_FULL features and more: 1), and a
+        release is in the span when it trails the best by at most CONTRA_SPAN.
+        """
+        n = len(self.versions)
+        usable = [i for i in range(len(self.functions))
+                  if not by_string or self.strings[i] >= floor]
+        usable_set = set(usable)
+
+        def weight(i: int) -> float:
+            size = self.strings[i] if by_string else len(self.functions[i][1])
+            return min(1.0, max(size - 1, 1) / (CONTRA_FULL - 1))
+
+        owns = [{i for i in usable if self.functions[i][0] >> v & 1} for v in range(n)]
+        hits = matched & usable_set
+        scores = [-sum(weight(i) for i in hits - own) for own in owns]
+        best = max(scores)
+        index_best = scores.index(best)
+        own = owns[index_best]
+        coverage = len(own & matched) / len(own) if own else 0.0
+        if coverage < MIN_COVERAGE or len(own & matched) < MIN_MATCHES:
+            return None
+        tied = [i for i, sc in enumerate(scores) if sc >= best - CONTRA_SPAN]
         low, high = self.versions[min(tied)], self.versions[max(tied)]
         return (self.versions[index_best], len(own & matched), len(own), coverage,
                 "" if low == high else f"{low}~{high}")
