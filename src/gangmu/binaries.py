@@ -473,22 +473,41 @@ def _by_functions(data: bytes, known: Sequence[Embedded], prints: Sequence) -> L
     image = None
     arch = None
     found: List[Embedded] = []
-    for display, name, reference in prints:
-        if name in named:
+    done = set()
+    # A rule may list a sidecar per architecture. Try the one built for this image's CPU
+    # first: it compares constants as well as strings, the others strings only.
+    todo = list(prints)
+    for display, name, reference in todo:
+        if name in named or name in done:
             continue
         if image is None:
             image, arch = image_features(data)
-        hit = reference.match(image, arch=arch) if image else None
-        if hit:
-            version, matched, total, coverage, tied = hit
-            found.append(Embedded(
-                name, display, tied or version,       # a tie is a "low~high" span, as elsewhere
-                f"{matched} of {total} fingerprinted functions of {display} {version} "
-                f"({coverage:.0%})" + (f"; releases {tied} fit equally well" if tied else "")
-                + _architecture_note(reference, arch)
-                + _calibration_note(reference)
-                + _coverage_note(reference, coverage),
-                method="functions"))
+        candidates = sorted((p for p in todo if p[1] == name),
+                            key=lambda p: 0 if arch and p[2].arch == arch else 1)
+        for display, name, reference in candidates:
+            hit = reference.match(image, arch=arch) if image else None
+            if hit:
+                version, matched, total, coverage, tied = hit
+                if _compared_by_strings(reference, arch) and len(reference.versions) > 1:
+                    # Strings alone cannot tell the releases of another CPU's build apart:
+                    # on Mbed TLS they named one wrong release with 0.60 confidence. Name
+                    # the library and everything the rule covers.
+                    tied = f"{reference.versions[0]}~{reference.versions[-1]}"
+                    version = ""
+                found.append(Embedded(
+                    name, display, tied or version,       # a tie is a "low~high" span, as elsewhere
+                    f"{matched} of {total} fingerprinted functions of {display}"
+                    + (f" {version}" if version else "")
+                    + f" ({coverage:.0%})"
+                    + ("; the version is not narrowed: all releases the rule covers are listed"
+                       if _compared_by_strings(reference, arch) and len(reference.versions) > 1
+                       else (f"; releases {tied} fit equally well" if tied else ""))
+                    + _architecture_note(reference, arch)
+                    + _calibration_note(reference)
+                    + _coverage_note(reference, coverage),
+                    method="functions"))
+                done.add(name)
+                break
     return found
 
 
@@ -505,8 +524,13 @@ def _coverage_note(prints, coverage: float) -> str:
             "fingerprinted ones and may not be the one in the image")
 
 
+def _compared_by_strings(prints, arch: Optional[str]) -> bool:
+    """The references were built for another CPU than this image: only strings were compared."""
+    return bool(arch and prints.arch and arch != prints.arch and prints.knows_strings())
+
+
 def _architecture_note(prints, arch: Optional[str]) -> str:
-    if arch and prints.arch and arch != prints.arch and prints.knows_strings():
+    if _compared_by_strings(prints, arch):
         return (f"; the references were built for {prints.arch} and this image is {arch}, so "
                 "only string literals were compared")
     return ""
