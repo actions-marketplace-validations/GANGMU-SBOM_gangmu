@@ -348,11 +348,30 @@ def arch_of_elf(info: ElfInfo) -> Optional[str]:
 
 # ----------------------------------------------------------------------- sweep
 
+class _Insn:
+    """What the boundary scan reads of an instruction. ``disasm_lite`` hands back plain
+    tuples, about twice as fast as Capstone's full instruction objects, which the scan
+    would only read four attributes of."""
+
+    __slots__ = ("address", "size", "mnemonic", "op_str", "_code", "_at")
+
+    def __init__(self, address: int, size: int, mnemonic: str, op_str: str,
+                 code: bytes, at: int) -> None:
+        self.address, self.size, self.mnemonic, self.op_str = address, size, mnemonic, op_str
+        self._code, self._at = code, at
+
+    @property
+    def bytes(self) -> bytes:
+        return self._code[self._at:self._at + self.size]
+
+
 def _decode(spec, code: bytes, base: int):
     md = capstone.Cs(spec.cs_arch, spec.cs_mode)
     md.skipdata = True
     md.skipdata_setup = ("db", None, None)
-    return md.disasm(code[:MAX_CODE], base)
+    code = code[:MAX_CODE]
+    for address, size, mnemonic, op_str in md.disasm_lite(code, base):
+        yield _Insn(address, size, mnemonic, op_str, code, address - base)
 
 
 def _scan(spec, code: bytes, base: int, inside: bool = False):
@@ -435,14 +454,17 @@ def sweep(code: bytes, base: int, arch: str, seeds: Sequence[int] = (),
     reliable |= calls
     if arch == "thumb":
         extent = max(reliable | {base}) + EXTENT
-        refs: Dict[int, int] = {}
+        refs: Dict[int, int] = {}          # pointers per target, literal pools in the code only
+        seen: Set[int] = set()
         tables: Set[int] = set()
         for blob in list(pools) + [code]:
             run: List[int] = []
             for off in range(0, len(blob) - 3, 4):
                 word = struct.unpack_from("<I", blob, off)[0]
                 if word & 1 and (word & ~1) in boundaries and (word & ~1) <= extent:
-                    refs[word & ~1] = refs.get(word & ~1, 0) + 1
+                    seen.add(word & ~1)
+                    if blob is code:
+                        refs[word & ~1] = refs.get(word & ~1, 0) + 1
                     run.append(word & ~1)
                     continue
                 if len(run) >= TABLE_RUN:
@@ -451,8 +473,11 @@ def sweep(code: bytes, base: int, arch: str, seeds: Sequence[int] = (),
             if len(run) >= TABLE_RUN:
                 tables.update(run)
         vectors = {w for w in seeds}
-        for target, count in refs.items():
-            if target in prologues or target in vectors or target in tables or count >= 2:
+        # (a data table's words that happen to look like addresses, in .rodata, repeat
+        # too: only a pointer repeated in the code's own literal pools counts)
+        for target in seen:
+            if target in prologues or target in vectors or target in tables \
+                    or refs.get(target, 0) >= 2:
                 reliable.add(target)
     starts: Set[int] = set(reliable)
     ordered = sorted(reliable | {base})
