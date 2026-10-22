@@ -2,6 +2,17 @@
 
 这里记录各版本新增的能力和当时的评测结果，按版本倒序。当前能力总览见 [README](../README.md)，各家国产生态的覆盖见 [CHINA.md](CHINA.md)。
 
+## 0.13.5
+* **CBOM 内置算法表认得更多库的函数名和 TLS 密码套件名。** 原来 AES、SHA、HMAC、RSA 等只认 Mbed TLS、wolfSSL、OpenSSL 的写法，现在补上 BearSSL（`br_aes_*`、`br_sha256_*`、`br_rsa_*`、`br_ecdsa_*`、`br_hmac_drbg_*`）、TinyCrypt（`tc_aes128_*`、`tc_sha256_*`、`tc_hmac_*`、`tc_ctr_prng_*`）、LibTomCrypt（`rijndael_*`、`rsa_make_key`、`ecc_sign_hash`、`sha256_init`）、libsodium（`crypto_hash_sha256`、`crypto_auth_hmacsha256`、`crypto_kdf_hkdf_*`）、Monocypher（`crypto_x25519`、`crypto_ed25519_*`、`crypto_chacha20_*`、`crypto_sha512`）和 OpenSSL 的 `EVP_aes_*_cbc`、`EVP_sha256` 等。liboqs 里小写的 `OQS_SIG_alg_slh_dsa_*`、`OQS_SIG_STFL_alg_xmss_*`、`OQS_LMS_ID_*` 也算进 SLH-DSA 和 LMS/XMSS。TLS 密码套件名（`TLS_ECDHE_RSA_WITH_…`，含 mbedTLS 的 `MBEDTLS_TLS_…`、BearSSL 的 `BR_TLS_…` 和 OpenSSL 风格的 `ECDHE-RSA-…`）按它带的密钥交换和认证算法计入 RSA、ECDSA、ECDH、DH，含 RC4、3DES 的套件计入对应的弱算法。对 BearSSL、Mbed TLS、OpenSSL、wolfSSL 和 hostap 的源码做了新旧对比，新命中的都是真实的接口名或套件名。规则库 gangmu-cbom-rules 的种子文件同步重新导出。
+
+## 0.13.4
+* **NVD 年份分片改用 xz 级别 3 写盘（原来是默认的 6）。** 压缩一个大分片从 10.5 s 降到 1.0 s，文件大约大三分之一（5000 条记录的模拟下载：每页都写盘、级别 6 要 45.8 s，攒批后 7.9 s，再加上级别 3 是 2.1 s；分片总大小 0.29 MB → 0.38 MB）。读取不受影响，已有的分片照常可读，下次重写时才换成新级别。
+* **`vuln-fetch --all` 的全量下载：进度、批量写盘、重试选项（#124、#125、#119）。**
+  * 每页取完打印位置和总数：`200 record(s) fetched, next index 105200, total 413013`；写盘时再打一行 `2000 record(s) saved, next index 105200`。
+  * 以前每取一页（小页时 200 条）就把涉及的每个年份分片整片重写，压缩一个大分片要十几秒：往一个 1.4 万条记录的分片里合并 200 条要 12 s，合并 2000 条也是 12.5 s，与批量大小几乎无关。现在攒够 2000 条再合并写盘（5000 条、每页 200 条的模拟下载：44.9 s → 7.9 s）。续传用的位置只在写盘成功之后才前进，出错或 Ctrl+C 之前先把已取到的存下来，所以不会丢，也不会跳过。
+  * 新增 `--page-size N`（1 到 2000）和 `--retries N`（默认 5；0 表示一直重试到成功，用 Ctrl+C 结束）；`-v` 时每次重试都打印原因和等待时间。网络类错误的退避上限从 60 s 降到 16 s（限流仍按服务器给的时间或最多 60 s）。
+* **预编译库和固件镜像的清点快了约 5 倍（ESP-IDF v5.4.2 的 183 个文件，17.7 s → 3.6 s），输出逐项不变。** 一个 32 KB 的分区表镜像被当成 Cortex-M 固件，在 64 个偏移上各做一次基址搜索，单这一个文件就要 8.8 s：基址评分改为一次统计所有候选，同一张镜像的布局结果也不再重复计算。版本横幅的正则先用字节查找排除不含对应字面量的文件，API 符号集合改为一次切分后查表。整树扫描：单进程冷扫 60.5 s → 50.1 s，热缓存 31.6 s → 17.5 s（峰值内存多约 17 到 28 MB）。数据见 PERFORMANCE.md，那一页同时改为当前版本的测量（原来还是 0.5/0.6 的数字）。
+
 ## 0.13.3
 * **修复：`vuln-fetch` 下载到一半遇到 `IncompleteRead` 直接崩溃（#118）。** 响应体被中途截断时抛出的是 `http.client.IncompleteRead`，它不是 `OSError`，`http_json` 没有捕获，于是不重试、直接带着 traceback 退出；截断的内容解析 JSON 失败（`ValueError`）也一样。现在这两种情况都按网络错误重试，重试用完后给出一条清楚的错误信息。
 * **`vuln-fetch` 的单页大小在传输失败时自动减半（#119）。** NVD 一页 2000 条有几兆字节，国内的网络上常常传到一大半被截断，重试同样大小的页也一直失败。现在一页重试用完仍然是传输失败（截断、读超时、连接被重置、响应不是 JSON）时，页大小减半重新请求，最小 100 条，并记进 `.gangmu-fetch.state` 的 `nvd_page`，下次运行直接用这个大小，不用再失败一遍。网络好的时候仍是 2000 条一页。

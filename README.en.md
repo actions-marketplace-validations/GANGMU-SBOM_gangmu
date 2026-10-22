@@ -75,10 +75,10 @@ All reproducible with the tools in this repository; see
 | Synthetic vendor modifications | **9/9 identified, 9/9 correct version** |
 | 10% of identifiers renamed | exact hashing 0.480 → abstract level **0.876** |
 | NTIA 2021 / CISA 2026 minimum elements | **10.0 / 10** both |
-| Whole ESP-IDF v5.4.2 (10,767 sources), single process | 72.5 s / 366 MB → **11.0 s / 123 MB**; warm rescan with 4 workers **2.1 s** |
-| 16x more rules (27 → 432, including the commercial packs) | scan time grows only about 2x: 3.2 s → 6.8 s |
+| Whole ESP-IDF v5.4.2 (10,767 sources; free rule base, 223 rules) | single process: cold 50.1 s / 375 MB, warm cache 17.5 s (the inventory of prebuilt libraries and firmware images went from 17.7 s to 3.6 s; 13.4 s warm with `--no-binaries`). 0.6 measured 11.0 s, but with a different pipeline and rule set; see [PERFORMANCE.md](docs/PERFORMANCE.md) |
+| 16x more rules (223 → 3,568, synthetic SDK, 0.13.3) | scan time grows about 3.4x: 7.3 s → 24.9 s |
 | FreeRTOS / RT-Thread copies in 7 Chinese vendor SDKs | **14/14** found, version exact or a range containing it |
-| Matching an SBOM against a full NVD mirror | 200.8 s / 3.9 GB → **8.9 s / 25 MB**, identical results |
+| Matching an SBOM against a full NVD mirror (measured at 0.6, not re-measured since) | 200.8 s / 3.9 GB → **8.9 s / 25 MB**, identical results |
 
 Identification is function level, following CENTRIS (ICSE 2021) and TIVER
 (ICSE 2025): a component is identified by how much of its own code is present,
@@ -141,7 +141,7 @@ The GitHub Action is listed on the [GitHub Marketplace](https://github.com/marke
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/GANGMU-SBOM/gangmu
-  rev: v0.13.3
+  rev: v0.13.5
   hooks:
     - id: gangmu-scan
 ```
