@@ -102,7 +102,8 @@ gangmu wrap -o compile_commands.json -- make -j8          # or watch a real buil
 # LICENSE text is recognised only for a few unmistakable permissive licences; copyleft is trusted from SPDX headers only. --no-licenses turns it off.
 gangmu vuln-fetch --db advisories/ --sbom sbom.json       # online step: only what this SBOM can match
 gangmu vuln-fetch --db advisories/ --threat                  # also CISA KEV + EPSS; `vuln` then ranks by exploited > EPSS > CVSS, `--fail-on kev` gates on KEV
-gangmu vuln sbom.json --db advisories/ --source ROOT [--symbols syms.json] [--reachability-vex]   # per finding: is the vulnerable function absent, unreferenced, or reachable from your code? Over-approximate source call graph (names, macros, tables); branches the build configuration rules out (`--config`, `-D`) are not counted; VEX is only changed with --reachability-vex
+gangmu vuln sbom.json --db advisories/ --source ROOT [--symbols syms.json] [--link-map fw.map] [--elf fw.elf] [--reachability-vex]   # per finding: is the vulnerable function absent, unreferenced, or reachable from your code? Over-approximate source call graph (names, macros, tables); branches the build configuration rules out (`--config`, `-D`) are not counted; with --link-map / --elf (built with -ffunction-sections) a function the linker dropped is reported `discarded`; VEX is only changed with --reachability-vex
+gangmu vuln-fetch --db advisories/ --sbom sbom.json --build-patches patches.json   # or: build the records for every advisory this SBOM matches and whose OSV record names the fix (online; needs git; --patch-limit N per run, goes on where it stopped)
 gangmu patch-build CVE-2025-1866 --db advisories/ -o patches.json   # record the functions the fix changed (fix commit read from the OSV record; or --repo URL --fix SHA)
 gangmu vuln sbom.json --db advisories/ --source ROOT --patches patches.json   # test the code, not the version: fixed body present -> resolved, vulnerable body present -> exploitable, edited -> left for a person (a near-identical variant is reported as likely_fixed / likely_vulnerable; --patch-near-vex lets it change the state)
 gangmu patch-verify rules/patches/*.json   # rebuild every patch record from the upstream commits it names; fails on any difference
@@ -141,7 +142,7 @@ The GitHub Action is listed on the [GitHub Marketplace](https://github.com/marke
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/GANGMU-SBOM/gangmu
-  rev: v0.13.6
+  rev: v0.13.7
   hooks:
     - id: gangmu-scan
 ```

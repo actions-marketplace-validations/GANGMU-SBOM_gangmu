@@ -226,18 +226,54 @@ def build_graph(root: Path, macros_known: Optional[Macros] = None,
 
 @dataclass
 class Reach:
-    status: str                       # reachable | unreachable | absent | unknown
+    status: str                       # reachable | unreachable | absent | discarded | unknown
     detail: str
     symbols: List[str] = field(default_factory=list)
     path: List[str] = field(default_factory=list)
-    basis: str = ""                   # "curated" | "advisory text"
+    basis: str = ""                   # "curated" | "patch record" | "advisory text"
+    image: str = ""                   # linked | discarded | unknown, when an image was read
 
     def to_dict(self) -> dict:
         out = {"status": self.status, "detail": self.detail,
                "symbols": self.symbols, "basis": self.basis}
         if self.path:
             out["path"] = self.path
+        if self.image:
+            out["image"] = self.image
         return out
+
+
+def apply_image(reach: Reach, image, graph: Graph, directory: str) -> Reach:
+    """Check a source-level verdict against the linked image.
+
+    The link map and the ELF symbol table say which functions reached the firmware
+    (``gangmu.image``). Only a function present in the source (``reachable`` or
+    ``unreachable``) is looked up. All of the advisory's functions dropped by the
+    linker makes the status ``discarded``, whatever the call graph said: the graph
+    over-approximates, the linker does not. Any one of them in the image keeps the
+    source verdict and records that it is linked. Anything else is left as it was."""
+    if reach.status not in ("reachable", "unreachable") or not reach.symbols:
+        return reach
+    prefix = _prefix(directory)
+    seen = []
+    for name in reach.symbols:
+        stems = {Path(f).stem for f in graph.defined.get(name, ()) if _inside(f, prefix)}
+        state, why = image.state(name, stems)
+        seen.append((name, state, why))
+    linked = [s for s in seen if s[1] == "linked"]
+    if linked:
+        reach.image = "linked"
+        reach.detail += f"; in the image: {linked[0][2]}"
+    elif all(s[1] == "discarded" for s in seen):
+        reach.detail = (f"{seen[0][2]}; the source analysis said {reach.status}. "
+                        "An inlined copy in kept code cannot be ruled out")
+        reach.status, reach.image = "discarded", "discarded"
+    else:
+        reach.image = "unknown"
+        hints = [s[2] for s in seen if s[2]]
+        if hints:
+            reach.detail += f"; image: {hints[0]}"
+    return reach
 
 
 def _reached(graph: Graph, directory: str) -> Tuple[Dict[str, Optional[str]], Set[str]]:
@@ -284,7 +320,10 @@ def assess(graph: Graph, directory: str, symbols: Sequence[str],
 
     ``basis`` decides what a missing definition means: for a curated list the
     function must exist in a complete copy, so its absence is informative; for
-    names mined from advisory text it only means the guess was wrong.
+    names mined from advisory text it only means the guess was wrong; for the
+    functions a fix's patch record says were changed it may mean a pruned copy or
+    a vendor rename, so it is not trusted either (a build configuration that
+    compiles the function out still is)
     """
     if not symbols:
         return Reach("unknown", "no vulnerable function is recorded for this advisory")
@@ -312,8 +351,11 @@ def assess(graph: Graph, directory: str, symbols: Sequence[str],
                          f"{', '.join(absent[:4])} is not defined anywhere under "
                          f"{directory or '.'}: this copy does not contain it",
                          list(symbols), basis=basis)
-        return Reach("unknown", "the functions named in the advisory text are not "
-                                "defined in this component", list(symbols), basis=basis)
+        source = ("recorded for the fix" if basis == "patch record"
+                  else "named in the advisory text")
+        return Reach("unknown", f"the functions {source} are not defined in this "
+                                "component (a pruned copy, a rename, or a wrong guess)",
+                     list(symbols), basis=basis)
     hit = [s for s in present if s in parent]
     if hit:
         chain = _path(parent, hit[0])

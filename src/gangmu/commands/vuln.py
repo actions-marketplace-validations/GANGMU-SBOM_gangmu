@@ -7,15 +7,16 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from ..core.packs import default_roots
+from ..vuln.match import vulnerability_key
 from ..vuln.model import VexState
 from ..vuln import (apply_linkage, candidates_from_cyclonedx, enrich as cn_enrich, load_cn_report,
                     load_database, match as match_vulns, wanted_for, summary as vex_summary,
                     to_vex, unmatched_components, without_cpe)
 
-from .common import (_resolve_jobs, _write)
+from .common import (_build_macros, _resolve_jobs, _write)
 
 
 def cmd_vuln(args: argparse.Namespace) -> int:
@@ -74,13 +75,21 @@ def cmd_vuln(args: argparse.Namespace) -> int:
         else:
             threat = None
 
+    records: dict = {}
     if args.patches or args.source:
-        rc = _apply_patches(args, matches)
+        records, rc = _load_patch_records(args)
+        if rc:
+            return rc
+        rc = _apply_patches(args, matches, records)
         if rc:
             return rc
 
+    if (args.link_map or args.elf) and not args.source:
+        print("error: --link-map and --elf on `vuln` need --source (they say which of the "
+              "source's functions reached the image)", file=sys.stderr)
+        return 2
     if args.source:
-        rc = _apply_reachability(args, matches)
+        rc = _apply_reachability(args, matches, records)
         if rc:
             return rc
 
@@ -186,18 +195,9 @@ def cmd_vuln(args: argparse.Namespace) -> int:
     return 0
 
 
-def _apply_patches(args: argparse.Namespace, matches) -> int:
-    """Test the code, not the version, for every advisory that has a patch record."""
-    from ..patchtest import (PatchError, assess, load_pack_patches, load_patches,
-                            near_names, records_for)
-    if not args.source:
-        print("error: --patches needs --source: the patch test reads the tree "
-              "that was scanned", file=sys.stderr)
-        return 2
-    root = Path(args.source)
-    if not root.is_dir():
-        print(f"error: --source {root} is not a directory", file=sys.stderr)
-        return 2
+def _load_patch_records(args: argparse.Namespace):
+    """(records, exit code): the patch records of the rule packs and ``--patches``."""
+    from ..patchtest import PatchError, load_pack_patches, load_patches
     records: dict = {}
     if not args.no_pack_patches:
         # Records the installed rule packs ship (patches/*.json): the community
@@ -209,13 +209,27 @@ def _apply_patches(args: argparse.Namespace, matches) -> int:
             records.update(load_pack_patches(roots))
         except PatchError as exc:
             print(f"error: {exc}", file=sys.stderr)
-            return 2
+            return {}, 2
     for path in args.patches or []:
         try:
             records.update(load_patches(Path(path)))
         except PatchError as exc:
             print(f"error: {exc}", file=sys.stderr)
-            return 2
+            return {}, 2
+    return records, 0
+
+
+def _apply_patches(args: argparse.Namespace, matches, records: dict) -> int:
+    """Test the code, not the version, for every advisory that has a patch record."""
+    from ..patchtest import assess, near_names, records_for
+    if not args.source:
+        print("error: --patches needs --source: the patch test reads the tree "
+              "that was scanned", file=sys.stderr)
+        return 2
+    root = Path(args.source)
+    if not root.is_dir():
+        print(f"error: --source {root} is not a directory", file=sys.stderr)
+        return 2
     if not records:
         return 0
     cache: dict = {}
@@ -324,35 +338,10 @@ def _fix_from_advisory(cve: str, db: Path):
     return "", []
 
 
-def _build_macros(args: argparse.Namespace, root: Path):
-    """The configuration to evaluate ``#if`` with, or None when none was given."""
-    from ..build.kconfig import find_kconfig, read_kconfig
-    from ..ifdef import Macros, collect_tree_defines, find_config_headers
-    paths = [Path(p) for p in (args.config or [])]
-    headers = [p for p in paths if p.suffix in (".h", ".hpp", ".hh")]
-    paths = [p for p in paths if p not in headers]
-    if not args.config:
-        found = find_kconfig(root)
-        paths = [found] if found else []
-        headers = find_config_headers(root)
-    defines = list(args.define or [])
-    if not (paths or headers or defines or args.assume_undefined_off):
-        return None
-    macros = Macros(assume_undefined=args.assume_undefined_off)
-    for path in paths:
-        try:
-            macros.add_kconfig(read_kconfig(path).values)
-        except OSError as exc:
-            print(f"warning: cannot read --config {path}: {exc}", file=sys.stderr)
-    for item in defines:
-        name, _, text = item.partition("=")
-        macros.define(name, text if "=" in item else "1")
-    collect_tree_defines(root, macros, headers)
-    return macros
-
-
-def _apply_reachability(args: argparse.Namespace, matches) -> int:
-    from ..reach import assess, build_graph, load_symbols, mine_symbols
+def _apply_reachability(args: argparse.Namespace, matches,
+                        records: Optional[dict] = None) -> int:
+    from ..patchtest import records_for
+    from ..reach import apply_image, assess, build_graph, load_symbols, mine_symbols
     root = Path(args.source)
     if not root.is_dir():
         print(f"error: --source {root} is not a directory", file=sys.stderr)
@@ -374,6 +363,19 @@ def _apply_reachability(args: argparse.Namespace, matches) -> int:
             print(f"error: cannot read --compile-db {args.compile_db}: {exc}",
                   file=sys.stderr)
             return 2
+    image = None
+    if args.link_map or args.elf:
+        from ..image import load_image
+        try:
+            image = load_image(Path(args.link_map) if args.link_map else None,
+                               Path(args.elf) if args.elf else None)
+        except OSError as exc:
+            print(f"error: cannot read the image: {exc}", file=sys.stderr)
+            return 2
+        for note in image.notes:
+            print(f"image: {note}", file=sys.stderr)
+        if not image.informative():
+            image = None
     graph = build_graph(root, macros, db)
     if db is not None and not graph.compile_db_used:
         print("reachability: --compile-db names none of the files under --source; "
@@ -394,12 +396,20 @@ def _apply_reachability(args: argparse.Namespace, matches) -> int:
             if str(key).upper() in curated:
                 names, basis = curated[str(key).upper()], "curated"
                 break
+        if names is None and records:
+            record = records_for(adv.id, adv.aliases, records)
+            if record is not None and record.vulnerable_functions():
+                names, basis = record.vulnerable_functions(), "patch record"
         if names is None:
             names, basis = mine_symbols(adv.summary), "advisory text"
         match.reach = assess(graph, match.directory, names, basis, cache)
+        if image is not None:
+            apply_image(match.reach, image, graph, match.directory)
         tally[match.reach.status] = tally.get(match.reach.status, 0) + 1
         if args.reachability_vex and match.state.value in ("in_triage", "exploitable"):
             if match.reach.status == "absent":
+                match.state, match.justification = VexState.NOT_AFFECTED, "code_not_present"
+            elif match.reach.status == "discarded":
                 match.state, match.justification = VexState.NOT_AFFECTED, "code_not_present"
             elif match.reach.status == "unreachable":
                 match.state, match.justification = VexState.NOT_AFFECTED, "code_not_reachable"
@@ -501,6 +511,42 @@ def cmd_vuln_coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_patches(args: argparse.Namespace, dest: Path, candidates: list, log) -> int:
+    """Patch records for the advisories the SBOM matches (the second online step)."""
+    from ..patchfetch import build_missing, fix_sources
+    from ..patchtest import PatchError, load_patches, load_skipped
+    out = Path(args.build_patches)
+    records: dict = {}
+    if out.exists():
+        try:
+            records = load_patches(out)
+        except PatchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    skipped = load_skipped(out)
+    advisories = load_database(dest, wanted_for(candidates))
+    matches = match_vulns(candidates, advisories)
+    sources = fix_sources(matches, advisories)
+    no_fix = len({vulnerability_key(m.advisory) for m in matches}) - len(sources)
+    try:
+        result = build_missing(sources, out, records, skipped, args.patch_limit,
+                               refresh=args.patch_refresh,
+                               log=lambda m: print(m, file=sys.stderr))
+    except KeyboardInterrupt:
+        print(f"stopped. The records built so far are saved in {out}; run the same "
+              "command again to go on.", file=sys.stderr)
+        return 130
+    for key, why in sorted(result.skipped.items()):
+        log(f"{key}: no record: {why}")
+    print(f"patch records: {len(result.built)} built, {len(result.skipped)} could not be "
+          f"recorded, {result.already} already in {out}, {result.deferred} left for the "
+          f"next run (--patch-limit {args.patch_limit}); {max(no_fix, 0)} matched "
+          "advisor(ies) name no fix commit")
+    for key, why in sorted(result.skipped.items())[:5]:
+        print(f"  {key}: {why}", file=sys.stderr)
+    return 0
+
+
 def cmd_vuln_fetch(args: argparse.Namespace) -> int:
     """Fill (or refresh) a local advisory directory; the one online step."""
     from datetime import datetime, timezone
@@ -510,13 +556,19 @@ def cmd_vuln_fetch(args: argparse.Namespace) -> int:
            else (lambda m: None))
     products: list = list(args.product or [])
     purls: list = list(args.purl or [])
+    if getattr(args, "build_patches", None) and not args.sbom:
+        print("error: --build-patches needs --sbom: records are built for the advisories "
+              "that SBOM matches", file=sys.stderr)
+        return 2
+    candidates: list = []
     if args.sbom:
         try:
             bom = json.loads(Path(args.sbom).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             print(f"error: cannot read SBOM {args.sbom}: {exc}", file=sys.stderr)
             return 2
-        wanted = wanted_for(candidates_from_cyclonedx(bom))
+        candidates = candidates_from_cyclonedx(bom)
+        wanted = wanted_for(candidates)
         products += sorted(wanted.cpe_keys)
         purls += sorted(wanted.purl_keys)
     scoped = bool(products or purls)
@@ -587,6 +639,10 @@ def cmd_vuln_fetch(args: argparse.Namespace) -> int:
         return 130
     print(f"{nvd_new} NVD record(s) new or changed, {osv_new} OSV record(s) "
           f"written under {dest}")
+    if getattr(args, "build_patches", None):
+        rc = _build_patches(args, dest, candidates, log)
+        if rc:
+            return rc
     if not api_key and not scoped:
         print("note: no NVD API key; a full download is paced at 5 requests per "
               "30 s. Set NVD_API_KEY to go roughly ten times faster.",

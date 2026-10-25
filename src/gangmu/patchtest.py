@@ -116,6 +116,15 @@ class PatchRecord:
     note: str = ""
     first_parent: bool = False        # a merge's net change against its first parent
 
+    def vulnerable_functions(self) -> List[str]:
+        """Names of the functions the fix changed or removed, i.e. that existed in the
+        vulnerable code (a function the fix only added has no vulnerable body)."""
+        seen: List[str] = []
+        for f in self.functions:
+            if (f.vulnerable or f.vulnerable_abstract) and f.function not in seen:
+                seen.append(f.function)
+        return seen
+
     def to_dict(self) -> dict:
         out: dict = {"functions": [f.to_dict() for f in self.functions]}
         if self.first_parent:
@@ -154,9 +163,23 @@ def load_patches(path: Path) -> Dict[str, PatchRecord]:
     return out
 
 
-def save_patches(path: Path, records: Dict[str, PatchRecord]) -> None:
-    body = {"format": FORMAT,
-            "patches": {k: records[k].to_dict() for k in sorted(records)}}
+def load_skipped(path: Path) -> Dict[str, str]:
+    """``{advisory: reason}`` for advisories a batch build tried and could not record."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    skipped = raw.get("skipped") if isinstance(raw, dict) else None
+    return ({str(k).upper(): str(v) for k, v in skipped.items()}
+            if isinstance(skipped, dict) else {})
+
+
+def save_patches(path: Path, records: Dict[str, PatchRecord],
+                 skipped: Optional[Dict[str, str]] = None) -> None:
+    body: dict = {"format": FORMAT,
+                  "patches": {k: records[k].to_dict() for k in sorted(records)}}
+    if skipped:
+        body["skipped"] = {k: skipped[k] for k in sorted(skipped)}
     Path(path).write_text(json.dumps(body, indent=1, sort_keys=True) + "\n",
                           encoding="utf-8")
 
@@ -169,13 +192,18 @@ def save_patches(path: Path, records: Dict[str, PatchRecord]) -> None:
 _NO_AUTO_GC = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"]
 
 
+GIT_TIMEOUT = 300       # seconds; a hung fetch must not stall a batch of records
+
+
 def _git(args: Sequence[str], cwd: Path) -> str:
     try:
         return subprocess.run(["git", *_NO_AUTO_GC, *args], cwd=cwd, check=True,
-                              capture_output=True, text=True,
+                              capture_output=True, text=True, timeout=GIT_TIMEOUT,
                               encoding="utf-8", errors="replace").stdout
     except FileNotFoundError as exc:
         raise PatchError("git is required to build patch records") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PatchError(f"git {' '.join(args[:3])} took more than {GIT_TIMEOUT} s") from exc
     except subprocess.CalledProcessError as exc:
         raise PatchError(f"git {' '.join(args[:3])} failed: "
                          f"{(exc.stderr or '').strip()[:200]}") from exc
