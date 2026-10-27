@@ -27,7 +27,8 @@ comes from similarity alone.
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from itertools import chain, compress, islice
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -55,6 +56,12 @@ VERSION_CONFIDENCE = {
 
 # A partial copy (``functions.subset``) is accepted when at least this many of its
 # functions are the component's and at least this share of its functions are.
+# How much more of a release the identifier-abstracted bodies must cover before the
+# copy is taken as renamed. The two measures have different denominators (bodies
+# that differ only in names collapse to one abstract hash), so on an untouched copy
+# the abstract one can come out a hair higher; a real rename moves it by tenths.
+RENAMED_MARGIN = 0.05
+
 SUBSET_MIN_FUNCTIONS = 40
 # Identity given to a weak resemblance that also defines the component's version.
 PROBE_CORROBORATED = 0.75
@@ -256,12 +263,21 @@ class MatchEngine:
         detecting B in a firmware would also "detect" A. CENTRIS removes such
         borrowed code from A's signature before matching.
 
-        The direction of borrowing cannot be read off the signatures alone, so
-        this takes the conservative symmetric form: **a function that appears in
-        more than one rule is application code for none of them.** That is
-        weaker than CENTRIS -- it also discards genuinely shared algorithmic
-        code, costing a little recall -- but it cannot invent a dependency that
-        is not there, and a false component in an SBOM is the costlier error.
+        The default is the conservative symmetric form: **a function that appears
+        in more than one rule is application code for none of them.** It cannot
+        invent a dependency that is not there, and a false component in an SBOM
+        is the costlier error. But applied alone it strips a library that many
+        projects bundle of its own identity: zlib, CMSIS-Core, littlefs and expat
+        kept a few per cent of their functions or none, so a modified copy of
+        them could only be found by anchor files, never by its code.
+
+        So the one direction the signatures do show is taken: when B is bundled
+        in A -- nearly all of one B release is inside A (``BUNDLED_SHARE``) and
+        that is a small part of A (``BUNDLE_HOST_SHARE``) -- the shared functions
+        are borrowed by A and stay B's own. A function stays B's only when every
+        other rule holding it bundles B; anything else (forks such as OpenSSL
+        and Tongsuo, a library split out of another such as Mbed TLS and Mbed
+        Crypto, generic code many rules happen to share) is still nobody's.
         """
         if self._segmented:
             return 0
@@ -282,32 +298,45 @@ class MatchEngine:
             key = rule.functions.sha256
             if key not in seen:
                 seen.add(key)
-                counted.append((rule.functions.family, signature))
+                counted.append((rule.functions.family, signature, key))
         # Rules of one family (sibling ports of a code base) count as one
         # contributor: what they share is the family's own code.
         families: dict = {}
-        contributors = []     # (exact hashes, abstract hashes) per contributor
-        for family, sig in counted:
+        contributors = []     # (exact hashes, abstract hashes, signatures) per contributor
+        sidecars = []         # the sidecar digests each contributor stands for
+        for family, sig, key in counted:
             if not family:
-                contributors.append((sig.hashes, set(sig.abstract_hashes)))
+                contributors.append((sig.hashes, set(sig.abstract_hashes), [sig]))
+                sidecars.append([key])
                 continue
-            exact, abstract = families.setdefault(family, (set(), set()))
+            if family not in families:
+                families[family] = len(contributors)
+                contributors.append((set(), set(), []))
+                sidecars.append([])
+            exact, abstract, members = contributors[families[family]]
             exact.update(sig.hashes)
             abstract.update(sig.abstract_hashes)
-        contributors.extend(families.values())
+            members.append(sig)
+            sidecars[families[family]].append(key)
         # A signature's hashes are distinct within it, so "in more than one
         # rule" is "repeated in the concatenation". Sorting one flat list and
         # comparing neighbours needs a fraction of the memory a counting dict
         # does, which matters once the rule base runs to hundreds of rules.
-        shared = _repeated(chain.from_iterable(exact for exact, _ in contributors))
+        shared = _repeated(chain.from_iterable(exact for exact, _, _ in contributors))
         abstract_shared = _repeated(chain.from_iterable(
-            abstract for _, abstract in contributors))
+            abstract for _, abstract, _ in contributors))
+        keep_exact, keep_abstract = _bundled_keep(contributors, shared, abstract_shared)
+        owner = {key: i for i, keys in enumerate(sidecars) for key in keys}
         marked = 0
-        for _, signature in specs:
+        for rule, signature in specs:
+            i = owner.get(rule.functions.sha256)
             if shared:
-                marked += signature.segment(shared)
+                kept = keep_exact.get(i) if i is not None else None
+                marked += signature.segment(shared - kept if kept else shared)
             if abstract_shared:
-                marked += signature.segment_abstract(abstract_shared)
+                kept = keep_abstract.get(i) if i is not None else None
+                marked += signature.segment_abstract(
+                    abstract_shared - kept if kept else abstract_shared)
         return marked
 
     def identify_directory(self, root: Path, directory: Path) -> List[Finding]:
@@ -645,22 +674,41 @@ class MatchEngine:
 
         # A vendor who renames symbols -- prefixing a whole library with their
         # own tag is routine -- defeats exact hashing: renaming a tenth of the
-        # identifiers was measured to take containment from 1.00 to 0.48. Fall
+        # identifiers was measured to take containment from 1.00 to 0.44. Fall
         # back to the abstracted bodies, which survive renaming, and score the
         # result lower because abstraction also discards real evidence.
         abstracted = False
         bands = spec.thresholds
         if containment < bands["strong"] and signature.abstract_hashes:
-            own_abs = (signature.version_abstract_hashes(verdict.best_index)
-                       if verdict.best_index >= 0 else set())
-            if own_abs:
-                abstract_present = candidate.abstract_functions
-                abstract_containment = len(abstract_present & own_abs) / len(own_abs)
-                if abstract_containment > containment:
+            abstract_present = candidate.abstract_functions
+
+            def abstract_share(index: int):
+                hashes = signature.version_abstract_hashes(index) if index >= 0 else set()
+                return (len(abstract_present & hashes) / len(hashes) if hashes else 0.0,
+                        hashes)
+
+            # A cheap test first, against the release the exact bodies point to (or
+            # the newest, when they point to none): most directories that fall short
+            # of a strong match were not renamed, and only a renamed one pays for
+            # reading the version a second time.
+            gate = (verdict.best_index if verdict.best_index >= 0
+                    else len(signature.versions) - 1)
+            if abstract_share(gate)[0] >= containment + RENAMED_MARGIN:
+                # The version is read from the abstracted bodies too: with names
+                # changed, few exact bodies are left to vote and the range widens.
+                abstract_verdict = infer_version(signature.abstract_view(), abstract_present)
+                at = abstract_verdict.best_index if abstract_verdict.best_index >= 0 else gate
+                abstract_containment, own_abs = abstract_share(at)
+                if abstract_containment >= containment + RENAMED_MARGIN:
                     containment = abstract_containment
                     matched = len(abstract_present & own_abs)
                     own = own_abs
                     abstracted = True
+                    if abstract_verdict.best:
+                        verdict = replace(
+                            abstract_verdict,
+                            detail="over identifier-abstracted bodies: "
+                                   + abstract_verdict.detail)
 
         if spec.subset and containment < bands["strong"]:
             # Not all of the release is here. For a partial copy, containment
@@ -725,14 +773,19 @@ class MatchEngine:
         the component. It is asserted only for rules that opt in, and only when
         enough functions are involved for a coincidence to be implausible and
         nearly all of the directory's own functions are the component's.
+
+        Only the component's own code counts, as for containment: functions the
+        segmentation found it shares with another rule (OP-TEE's bundled Mbed TLS)
+        say nothing about this component, or a copy of the other one's headers
+        reads as a partial copy of this one.
         """
-        matched = present & signature.hash_set
+        matched = present & signature.application_hashes
         if len(matched) < subset_min:
             return None
         share = len(matched) / len(present)
         if share < SUBSET_MIN_SHARE:
             return None
-        verdict = infer_version_subset(signature, present)
+        verdict = infer_version_subset(signature, _without_borrowed(signature, present))
         if not verdict.best:
             return None
         evidence.append(Evidence(
@@ -758,15 +811,16 @@ class MatchEngine:
         coincidence. Reported as a modified derivative: weak identity, no version
         (the identical functions come from several releases and the rest are the
         vendor's), so the advisory matcher can only report this product's
-        advisories as ``in_triage``, never as exploitable.
+        advisories as ``in_triage``, never as exploitable. Borrowed code does not
+        count, as in ``_by_subset``.
         """
-        matched = present & signature.hash_set
+        matched = present & signature.application_hashes
         if len(matched) < DERIVATIVE_MIN_FUNCTIONS:
             return None
         share = len(matched) / len(present)
         if share < DERIVATIVE_MIN_SHARE:
             return None
-        verdict = infer_version_subset(signature, present)
+        verdict = infer_version_subset(signature, _without_borrowed(signature, present))
         evidence.append(Evidence(
             technique=Technique.AST_FINGERPRINT,
             confidence=DERIVATIVE_IDENTITY,
@@ -890,6 +944,132 @@ def _unique_glob(directory: Path, tail: str, depth: int, deep: bool = False) -> 
         if found and not deep:
             break
     return found[0] if len(found) == 1 else None
+
+
+# B is bundled in A when nearly all of one B release is inside A ...
+BUNDLED_SHARE = 0.80
+# ... and that is a small part of A. Mbed Crypto is 18% of Mbed TLS and Tongsuo far more
+# of OpenSSL: lineage, not a bundled copy; zlib is under 5% of any project carrying it.
+BUNDLE_HOST_SHARE = 0.10
+# A function more rules than this share is generic code, not one project's copy of another.
+BUNDLE_MAX_OWNERS = 16
+# A recorded release smaller than this proves no bundling: the 5 to 60 functions some rules
+# record for an early release fit inside an unrelated project by way of a shared helper.
+BUNDLED_MIN_FUNCTIONS = 40
+# ... nor does one far smaller than the rule's largest: a signature that recorded little of a
+# release (Tasmota 15.x: 53 functions, against 974 for 9.4.0) holds mostly some third library,
+# and two projects that bundle that library would look as if one bundled the other.
+BUNDLED_MIN_OF_LARGEST = 0.5
+
+
+def _bundled_keep(contributors, shared: set, abstract_shared: set):
+    """{contributor: hashes it keeps as its own} for the bundled side of each bundle.
+
+    A contributor keeps a shared hash only when every other contributor holding it
+    bundles that contributor; see ``MatchEngine.segment_rule_base``."""
+    owners: Dict[int, List[int]] = {}
+    for i, (exact, _, _) in enumerate(contributors):
+        for h in shared.intersection(exact):
+            owners.setdefault(h, []).append(i)
+    pair: Dict[Tuple[int, int], List[int]] = {}       # (a, b) -> the hashes they share
+    for h, held in owners.items():
+        if len(held) > BUNDLE_MAX_OWNERS:
+            continue
+        for a in held:
+            for b in held:
+                if a != b:
+                    pair.setdefault((a, b), []).append(h)
+
+    bundles: set = set()      # (host, bundled)
+    for (a, b), common in pair.items():
+        # Fewer shared functions than the smallest release that can prove bundling would
+        # need: no release of B can be inside A. Most pairs end here, cheaply.
+        if len(common) < BUNDLED_SHARE * BUNDLED_MIN_FUNCTIONS:
+            continue
+        if len(common) > BUNDLE_HOST_SHARE * len(contributors[a][0]):
+            continue
+        for sig in contributors[b][2]:
+            sizes = _release_sizes(sig)
+            floor = max(BUNDLED_MIN_FUNCTIONS, BUNDLED_MIN_OF_LARGEST * max(sizes, default=0))
+            if len(common) < BUNDLED_SHARE * floor:
+                continue        # not even a release of the smallest size that counts fits
+            inside = _release_counts(sig, common)
+            if any(size >= floor and inside[v] >= BUNDLED_SHARE * size
+                   for v, size in enumerate(sizes)):
+                bundles.add((a, b))
+                break
+    if not bundles:
+        return {}, {}
+
+    def keepers(held: Sequence[int]) -> Optional[int]:
+        if len(held) > BUNDLE_MAX_OWNERS:
+            return None
+        for x in held:
+            if all((y, x) in bundles for y in held if y != x):
+                return x
+        return None
+
+    # Only a bundled contributor can keep anything, so only its hashes are looked at.
+    bundled = {b for _, b in bundles}
+    keep_exact: Dict[int, set] = {}
+    for b in bundled:
+        for h in shared.intersection(contributors[b][0]):
+            if keepers(owners[h]) == b:
+                keep_exact.setdefault(b, set()).add(h)
+    candidates: set = set()
+    for b in bundled:
+        candidates |= abstract_shared.intersection(contributors[b][1])
+    abstract_owners: Dict[int, List[int]] = {}
+    if candidates:
+        for i, (_, abstract, _) in enumerate(contributors):
+            for h in candidates.intersection(abstract):
+                abstract_owners.setdefault(h, []).append(i)
+    keep_abstract: Dict[int, set] = {}
+    for h, held in abstract_owners.items():
+        x = keepers(held)
+        if x is not None:
+            keep_abstract.setdefault(x, set()).add(h)
+    return keep_exact, keep_abstract
+
+
+def _without_borrowed(signature, present):
+    """*present* minus the functions segmentation marked as another rule's. What is left
+    still counts the directory's own, unrecorded functions (a vendor's additions)."""
+    borrowed = signature.hash_set - signature.application_hashes
+    return present - borrowed if borrowed else present
+
+
+def _release_counts(sig, hashes: Sequence[int]) -> List[int]:
+    """How many of *hashes* each recorded release of *sig* holds, read off the bitmaps."""
+    counts = [0] * len(sig.versions)
+    index, bitmaps = sig.index, sig.bitmaps
+    for h in hashes:
+        i = index.get(h)
+        if i is None:
+            continue
+        bits = bitmaps[i]
+        while bits:
+            low = bits & -bits
+            counts[low.bit_length() - 1] += 1
+            bits ^= low
+    return counts
+
+
+def _release_sizes(sig) -> List[int]:
+    """Functions per recorded release, without building one set per release.
+
+    A function unchanged over a run of releases shares its bitmap with every other such
+    function, so a signature has far fewer distinct bitmaps than functions: those are
+    counted first (in C), and only they are taken apart bit by bit."""
+    def build() -> List[int]:
+        sizes = [0] * len(sig.versions)
+        for bits, n in Counter(sig.bitmaps).items():
+            while bits:
+                low = bits & -bits
+                sizes[low.bit_length() - 1] += n
+                bits ^= low
+        return sizes
+    return sig._memo("release-sizes", build)
 
 
 def _repeated(values) -> set:
