@@ -122,9 +122,13 @@ def _scan(root: Path, rulebase: RuleBase, build_facts: Optional[BuildFacts],
     if options.loose:
         # What no directory explains: a component's files dropped in among the
         # project's own (app/lwprintf.c beside app/main.c).
+        superseded: List[Finding] = []
         loose = find_loose(root, engine, store, findings,
                            build_facts.compiled if build_facts and build_facts.compiled else None,
-                           asserted=options.possible_below, absorbed=absorbed)
+                           asserted=options.possible_below, absorbed=absorbed,
+                           superseded=superseded)
+        # A directory that only encloses a copy found below it is not that copy.
+        findings = [f for f in findings if not any(f is s for s in superseded)]
         # A resemblance at a directory gives way to the component's own files in it.
         placed = {(f.rule_id, f.directory) for f in loose}
         findings = [f for f in findings if f.identity_confidence >= options.possible_below
@@ -691,9 +695,21 @@ def _explains(inner: Finding, outer: Finding) -> bool:
     """
     if inner.identity_confidence < outer.identity_confidence:
         return False
+    # A file the rule pins by hash, found where the rule puts it relative to the
+    # enclosing directory, says that directory is the component's root: an
+    # ancestor that only contains the code (os/ around dfs/elmfat) has none at its
+    # own level. pf-ring's root keeps its anchor against drivers/intel, which
+    # matches the same release by functions alone.
+    if _hash_matched(outer) and not _hash_matched(inner):
+        return False
     if outer.version is None or inner.version == outer.version:
         return True
     return inner.confidence >= outer.confidence
+
+
+def _hash_matched(finding: Finding) -> bool:
+    return any(e.technique is Technique.HASH_COMPARISON
+               for e in getattr(finding, "evidence", ()))
 
 
 def _drop_shadowing_ancestors(candidates: List[Finding]) -> List[Finding]:
