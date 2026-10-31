@@ -73,7 +73,7 @@ Python、JavaScript、Go、Rust 都有锁文件，生成 SBOM 基本就是读文
 | --- | --- |
 | 源码识别（gangmu-bench 139 个用例：上游发布版源码树、9 个芯片 SDK 里的 57 份副本，264 个应识别的组件） | **召回率 100%**（264/264）、**精确率 100%**（报出的 329 个组件里 0 个误报）；版本完全正确 89.8%，正确或区间含真值 98.8% |
 | 源码自检（227 条规则各自钉定的上游发布版，用整个规则库扫） | 召回率 98.7%（224/227），精确率 99.3%（284 个组件里 2 个误报） |
-| 二进制识别（交叉编译语料：14 个库、15 组构建 × 4 种架构，剥离符号） | 同架构召回率 72% 到 81%、精确率 95% 到 100%；认出的镜像里版本正确或区间含真值 97% 到 100%，唯一定到一个版本的 37% 到 47%；跨架构只比字符串，召回率 36% 到 55%。见 [BINARY-VALIDATION.md](docs/BINARY-VALIDATION.md) |
+| 二进制识别（交叉编译语料：14 个库、15 组构建 × 4 种架构，剥离符号） | 同架构召回率 77% 到 83%、精确率 99.7% 到 100%；认出的镜像里版本正确或区间含真值 96% 到 100%，唯一定到一个版本的 36% 到 43%；跨架构只比字符串，召回率 36% 到 59%。见 [BINARY-VALIDATION.md](docs/BINARY-VALIDATION.md) |
 | 区分「厂商 fork」与「换了个版本」 | 目录级相似度只差 **0.06**；函数级拉开到 **0.24**（四倍） |
 | 真实 lwIP 发布版的版本识别 | **6/6**：5 个发布版报出的就是其版本，乐鑫生产 fork 报 `2.2.0~2.2.1`、最可能的是 2.2.0 |
 | 合成厂商修改下的识别 | **9/9 识别、9/9 版本正确**（改名、删文件、加代码、重排版） |
@@ -154,23 +154,29 @@ GPL 类只信 SPDX 文件头。`--no-licenses` 关闭。
 
 ### 在 CI 里用
 
-GitHub Action 已上架 [GitHub Marketplace](https://github.com/marketplace/actions/gangmu-sbom)。
+GitHub Action 已上架 [GitHub Marketplace](https://github.com/marketplace/actions/gangmu-sbom)。`@v0` 跟着每个 0.x 版本走，也可以写成固定的 `@v0.16.0`。
 
 ```yaml
 # GitHub Actions
 - uses: GANGMU-SBOM/gangmu@v0
+  id: sbom
   with:
+    version: 0.16.0                  # 固定 gangmu 版本，同一个提交过一阵再跑，SBOM 也一样
     compile-db: build/compile_commands.json
     link-map: build/my-project.map
     app-name: my-firmware
     app-version: ${{ github.ref_name }}
     output: sbom.cdx.json
+    upload: true                     # 把 SBOM 作为 workflow artifact 上传
+# 之后的步骤里可以用 ${{ steps.sbom.outputs.sbom-file }} 和 ${{ steps.sbom.outputs.components }}
 ```
+
+默认带上 Capstone（`extras: disasm`），预编译库和固件镜像也逐函数识别；`extras: ""` 只装纲目本身。每次运行都在 job 的 Summary 里写出工具版本、SBOM 文件和组件数。
 
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/GANGMU-SBOM/gangmu
-  rev: v0.15.0
+  rev: v0.16.0
   hooks:
     - id: gangmu-scan
 ```
@@ -184,7 +190,6 @@ GitHub Action 已上架 [GitHub Marketplace](https://github.com/marketplace/acti
     fail-on: quantum-vulnerable
 ```
 
-迁移摘要需要 gangmu 0.9 及以上。
 
 ### 漏洞比对与合规
 
