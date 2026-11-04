@@ -72,7 +72,7 @@ Measured with the current code and the free rule base 2026.10.29; all reproducib
 | --- | --- |
 | Source identification (gangmu-bench, 139 cases: upstream release trees and 57 copies in 9 vendor SDKs, 264 components to find) | **recall 100%** (264/264), **precision 100%** (0 false positives among 329 components reported); version exact 89.8%, exact or a range containing it 98.8% |
 | Source self-scan (the pinned upstream release of 227 rules, whole rule base) | recall 98.7% (224/227), precision 99.3% (2 false positives among 284 components) |
-| Binary identification (cross-compiled corpus: 14 libraries, 15 builds, 4 architectures, stripped) | same architecture: recall 77% to 83%, precision 99.7% to 100%; version right or a range containing it for 96% to 100% of the images found, a single exact version for 36% to 43%; across architectures (strings only) recall 36% to 59%. See [BINARY-VALIDATION.md](docs/BINARY-VALIDATION.md) |
+| Binary identification (cross-compiled corpus: 14 libraries, 15 builds, 4 architectures, stripped) | same architecture: recall 77% to 82%, precision 100%; a single exact version for 54% to 61% of the images found, the version right or a range containing it for 98.6% to 100%; across architectures (strings only) recall 32% to 34%. See [BINARY-VALIDATION.md](docs/BINARY-VALIDATION.md) |
 | Separating "vendor fork" from "different release" | whole-tree similarity gap **0.06**; function level **0.24** |
 | Version accuracy on real lwIP releases | **6/6**: five releases reported as exactly their version; Espressif's production fork as `2.2.0~2.2.1`, best match 2.2.0 |
 | Synthetic vendor modifications | **9/9 identified, 9/9 correct version** |
@@ -130,14 +130,14 @@ also available). No finding claims certainty: confidence is capped at 0.95.
 
 ### In CI
 
-The GitHub Action is listed on the [GitHub Marketplace](https://github.com/marketplace/actions/gangmu-sbom). `@v0` follows every 0.x release; pin `@v0.16.0` to stay on one.
+The GitHub Action is listed on the [GitHub Marketplace](https://github.com/marketplace/actions/gangmu-sbom). `@v0` follows every 0.x release; pin `@v0.17.0` to stay on one.
 
 ```yaml
 # GitHub Actions
 - uses: GANGMU-SBOM/gangmu@v0
   id: sbom
   with:
-    version: 0.16.0                  # pin gangmu: the same commit gives the same SBOM later
+    version: 0.17.0                  # pin gangmu: the same commit gives the same SBOM later
     compile-db: build/compile_commands.json
     link-map: build/my-project.map
     app-name: my-firmware
@@ -152,7 +152,7 @@ Capstone is installed by default (`extras: disasm`), so prebuilt libraries and f
 ```yaml
 # .pre-commit-config.yaml
 - repo: https://github.com/GANGMU-SBOM/gangmu
-  rev: v0.16.0
+  rev: v0.17.0
   hooks:
     - id: gangmu-scan
 ```

@@ -53,10 +53,15 @@ MIN_COVERAGE = 0.12       # share of the best release's fingerprintable function
 #                         unrelated library through in 1920 negative pairs on RISC-V)
 SMALL_MATCHES = 3         # fewer than MIN_MATCHES are enough when they are most of the release:
 SMALL_COVERAGE = 0.5      # a library with four fingerprintable functions could never reach five
-MAGNET_RATIO = 32         # a print is not found in a function this many times its size: an
+BEST_FIT = True           # one image function votes as one version of a function (_best_fits)
+SAME_FUNCTION = 0.5       # prints sharing this much of the smaller one are versions of one function
+TABLE_BYTES = 16          # bytes of a referenced data object that stand for it (fprint.Memory.table)
+MAGNET_RATIO = 16         # a print is not found in a function this many times its size: an
 #                           error-string switch or a constant table holds hundreds of values and
 #                           so, by chance, small prints of unrelated libraries (Cortex-M corpus:
-#                           ~2,300 wrong-library matches there against ~170 in all smaller sets)
+#                           ~2,300 wrong-library matches above 32 times against ~170 in all
+#                           smaller sets; at 32 Brotli still matched two yyjson -O0 images)
+STRING_MAGNET_RATIO = 32  # the same when only strings are compared: a print has few of them
 TIE_SHARE = 0.85         # releases scoring within this share of the best are reported as a span
 #                         (0.95 asserted a wrong release in 3 of 48 real builds, 0.85 in none)
 CONTRA_FULL = 4.0         # features at which a matched print counts in full as evidence
@@ -90,6 +95,8 @@ class Memory:
 
     regions: List[Tuple[int, bytes]] = field(default_factory=list)
     ranges: List[Tuple[int, int]] = field(default_factory=list)   # allocated, no bytes (.bss)
+    data: Optional[List[Tuple[int, int]]] = None   # read-only or initialised data, not code:
+    #                             None when the container does not say (a raw image)
     gp: Optional[int] = None    # MIPS global pointer: where ``$gp``-relative loads start from
     pic: bool = False           # position-independent (a shared object, linked at 0): code
     #                             reaches addresses relative to itself, so an immediate is a
@@ -104,6 +111,24 @@ class Memory:
             if start <= addr and addr + n <= start + len(blob):
                 return blob[addr - start:addr - start + n]
         return None
+
+    def table(self, addr: int) -> Optional[bytes]:
+        """The first bytes of a data object at *addr*: a constant table (a CRC table, a
+        Huffman table, an S-box) is the same in every build and at every optimisation level,
+        though where the linker puts it is not. None for code, for a container that does not
+        say what is code, and for bytes that tell nothing (zeros, or a short string, whose
+        neighbours depend on the layout)."""
+        if self.data is None or not any(lo <= addr < hi for lo, hi in self.data):
+            return None
+        raw = self.read(addr, TABLE_BYTES)
+        if raw is None or raw.count(0) > TABLE_BYTES // 2 or len(set(raw)) < 4:
+            return None
+        if all(32 <= c < 127 or c in (0, 9, 10, 13) for c in raw):
+            return None
+        words = [int.from_bytes(raw[i:i + 4], "little") for i in range(0, TABLE_BYTES, 4)]
+        if sum(1 for w in words if self.is_address(w)) >= 2:
+            return None              # a table of pointers moves with the layout
+        return raw
 
     def contains(self, addr: int) -> bool:
         return any(start <= addr < start + len(blob) for start, blob in self.regions)
@@ -129,7 +154,9 @@ def memory_from_elf(data: bytes, info: ElfInfo) -> Memory:
                if s.flags & 2 and s.type == 1 and placed(s) and s.size]   # SHF_ALLOC, PROGBITS
     bss = [(s.addr, s.addr + s.size) for s in info.sections
            if s.flags & 2 and s.type == 8 and placed(s) and s.size]       # SHT_NOBITS
-    mem = Memory(regions, bss, pic=info.etype == ET_DYN)
+    tables = [(s.addr, s.addr + s.size) for s in info.sections            # not SHF_EXECINSTR
+              if s.flags & 2 and not s.flags & 4 and s.type == 1 and placed(s) and s.size]
+    mem = Memory(regions, bss, tables, pic=info.etype == ET_DYN)
     if info.machine == disasm.EM_MIPS:
         got = next((sec for sec in info.sections if sec.name == ".got"), None)
         if got is not None:
@@ -188,11 +215,13 @@ class FeatureSet(set):
 
     strings: Set[int]
     calls: Set[int]           # direct call targets (addresses), for closures
+    closure: bool             # a function together with its callees (closures_of)
 
-    def __init__(self, items=(), strings=(), calls=()):
+    def __init__(self, items=(), strings=(), calls=(), closure=False):
         super().__init__(items)
         self.strings = set(strings)
         self.calls = set(calls)
+        self.closure = closure
 
 
 def _a64(insn, reg: int) -> str:
@@ -222,6 +251,8 @@ def function_features(mem: Memory, arch: str, address: int, size: int) -> "Featu
                 h = _hash(b"s", s)
                 out.add(h)
                 out.strings.add(h)
+            elif (table := mem.table(v)) is not None:
+                out.add(_hash(b"d", table))
         elif _distinctive(v):
             out.add(_hash(b"c", v.to_bytes(8, "big")))
 
@@ -480,14 +511,19 @@ def closures_of(functions: Dict[int, "FeatureSet"]) -> List["FeatureSet"]:
     reference function built at -O2 can hold features that an -O0 image keeps in two
     functions (N2NMatcher, arXiv:2608.10043, on inlining and binary decomposition). Matching
     is by containment, so the union is what such a reference is found in. Only the image
-    side is closed: a closure of the references would claim the callees twice."""
+    side is closed: a closure of the references would claim the callees twice.
+
+    A closure only extends a library already anchored by functions matched on their own
+    (:meth:`FunctionPrints.match`), and never votes on the release: a callee's features can
+    be another release's, and small prints of unrelated libraries sit in a big enough union
+    by chance (LibAM, arXiv:2305.04026: anchors first, then their neighbourhood)."""
     out: List[FeatureSet] = []
     for address, feats in functions.items():
         callees = [functions[c] for c in feats.calls if c != address and c in functions]
         callees = [c for c in callees if c]
         if not callees or len(callees) > MAX_CALLEES:
             continue
-        closure = FeatureSet(feats, feats.strings)
+        closure = FeatureSet(feats, feats.strings, closure=True)
         for c in callees:
             closure |= c
             closure.strings |= c.strings
@@ -735,8 +771,12 @@ class FunctionPrints:
         floor = MIN_FEATURES if min_features is None else min_features
         by_string = bool(arch and self.arch and arch != self.arch and self.knows_strings())
         index = self.index(by_string)
-        matched: Set[int] = set()
+        direct: Set[int] = set()       # matched by a function on its own: the anchors
+        extended: Set[int] = set()     # matched only inside a closure
+        voters: Set[int] = set()       # of the direct matches, the best fits (_best_fits)
         for feats in image:
+            closure = getattr(feats, "closure", False)
+            into = extended if closure else direct
             if by_string:
                 feats = cast(Set[int], getattr(feats, "strings", None) or set())
                 if len(feats) < floor:
@@ -745,15 +785,20 @@ class FunctionPrints:
             for f in feats:
                 for i in index.get(f, ()):
                     votes[i] = votes.get(i, 0) + 1
+            found = []
             for i, hits in votes.items():
                 size = self.strings[i] if by_string else len(self.functions[i][1])
                 if hits >= min(floor, size) and hits >= MIN_CONTAINMENT * size \
-                        and len(feats) <= MAGNET_RATIO * size:
-                    matched.add(i)
-        if len(matched) < SMALL_MATCHES:
+                        and len(feats) <= (STRING_MAGNET_RATIO if by_string else MAGNET_RATIO) * size:
+                    found.append(i)
+            into.update(found)
+            if not closure:
+                voters.update(self._best_fits(found, feats, by_string) if BEST_FIT else found)
+        if len(direct) < SMALL_MATCHES:
             return None
+        matched = direct | extended
         if tie_share is None:
-            return self._contradiction(matched, by_string, floor)
+            return self._contradiction(matched, by_string, floor, scored=voters)
         scores, owns = [], []
         for v in range(len(self.versions)):
             own = {i for i, (bits, _) in enumerate(self.functions)
@@ -778,7 +823,36 @@ class FunctionPrints:
         return (self.versions[index_best], len(own & matched), len(own), coverage,
                 "" if low == high else f"{low}~{high}")
 
-    def _contradiction(self, matched: Set[int], by_string: bool, floor: int):
+    def _features(self, i: int, by_string: bool) -> Tuple[int, ...]:
+        feats = self.functions[i][1]
+        return feats[:self.strings[i]] if by_string else feats
+
+    def _best_fits(self, found: List[int], image: Set[int], by_string: bool) -> List[int]:
+        """Of the prints one image function contains, the ones it is.
+
+        Containment lets the smaller print of an older release match the grown function of
+        a newer one, so both releases' prints of that function matched and each contradicted
+        the other: on the benchmark corpus most ranges came from such pairs. Prints that are
+        mostly the same features are versions of one function, and only the closest (most
+        of the image function explained, then the fewest features of the print missing)
+        votes on the release; all of them still count towards finding the library. Prints
+        of different functions, such as callees inlined into it, all vote."""
+        if len(found) < 2:
+            return found
+        sets = {i: set(self._features(i, by_string)) for i in found}
+
+        def closeness(i: int) -> Tuple[float, float]:
+            shared = len(sets[i] & image)
+            return (shared / len(sets[i] | image), shared / len(sets[i]))
+        kept: List[int] = []
+        for i in sorted(found, key=closeness, reverse=True):
+            if all(len(sets[i] & sets[j]) < SAME_FUNCTION * min(len(sets[i]), len(sets[j]))
+                   for j in kept):
+                kept.append(i)
+        return kept
+
+    def _contradiction(self, matched: Set[int], by_string: bool, floor: int,
+                       scored: Optional[Set[int]] = None):
         """Release scores by the weighted count of matched prints the release lacks.
 
         The share-explained score treats the 3rd contradiction among 20 matches like the
@@ -786,6 +860,9 @@ class FunctionPrints:
         functions, as much as a fifty-feature one. Here each matched print the release
         does not contain costs its weight (CONTRA_FULL features and more: 1), and a
         release is in the span when it trails the best by at most CONTRA_SPAN.
+
+        *scored*: the matches that vote on the release (default: all of *matched*); the
+        others count only towards coverage.
         """
         n = len(self.versions)
         usable = [i for i in range(len(self.functions))
@@ -797,7 +874,7 @@ class FunctionPrints:
             return min(1.0, max(size - 1, 1) / (CONTRA_FULL - 1))
 
         owns = [{i for i in usable if self.functions[i][0] >> v & 1} for v in range(n)]
-        hits = matched & usable_set
+        hits = (matched if scored is None else scored) & usable_set
         scores = [-sum(weight(i) for i in hits - own) for own in owns]
         best = max(scores)
         index_best = scores.index(best)
