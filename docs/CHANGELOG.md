@@ -2,14 +2,30 @@
 
 这里记录各版本新增的能力和当时的评测结果，按版本倒序。当前能力总览见 [README](../README.md)，各家国产生态的覆盖见 [CHINA.md](CHINA.md)。
 
-## 0.18.0
+## 未发布
+* **修正：OpenSSL 1.0.2za 这类双字母版本按顺序比较。** OpenSSL 1.0.2 一直发到 1.0.2zl，z 之后是 za、zb……；原来只认单个字母，`1.0.2za` 被当成 `1.0.2`，于是 1.0.2l 看起来比每个修复版本都新。NVD 截止到 1.0.2zc、1.0.2zf、1.0.2zj 的范围因此全部判成 not affected：用户固件 SBOM 里 OpenSSL 1.0.2l 有 27 个漏洞（CVE-2022-0778、CVE-2023-0286、CVE-2024-0727 等）被漏报，现在判为 exploitable。
+* **一条记录判定不了的漏洞，以另一条记录的判定为准。** 版本放不进范围（OSV 只给提交、没有可比较的版本）时结果是 in_triage，原来它总盖过 NVD 等来源明确的 affected / not affected。现在明确的判定优先；但 OSV 由标签列表推出的“不在列表里”和 NVD 逐个列出版本时的“不在列表里”只是推断（列表常不全，CVE-2023-51767 写的是 OpenSSH “through 10.0”），不算判定。用户 SBOM 中有 23 个漏洞因此有了结论。
+
+## 0.18.3
+* **只写了 purl 的组件也能按 CPE 匹配 NVD。** 别的工具生成的 SBOM 常常只有 purl 没有 CPE，NVD 按 CPE 登记的记录就够不着。现在 `gangmu vuln` 给没有 CPE 的组件补上认领它 purl（自身 purl 或 `upstream.identifiers`）的规则的 CPE 和 `cpe_aliases`；几条规则对同一 purl 给出不同 CPE 时不补。经由规则 CPE 的匹配会注明；`--no-purl-aliases` 一并关闭。用户固件 SBOM（21 个组件，全部 purl）的 exploitable 由 48 增至 131，OpenSSL、busybox、libevent 等只有 NVD 能判定的漏洞都有了结论。
+* **OSV 记录和 NVD 的 CPE 范围结论相反时，列为 in_triage。** 原来取最严重的结论，OSV 由 GIT 推出的受影响标签列表出错时（OpenSSH 7.5p1 的 CVE-2024-6387、OpenSSL 1.0.2l 的 CVE-2021-4044）照样判 exploitable。现在一方说受影响、另一方说不受影响时列为 in_triage，说明里写出两边的记录和理由。发行版按自己修订号作出的判定仍然优先于任何上游范围（修正：原来 NVD 的上游范围会盖过 Debian 对回移植修复的 not affected）。
+* **修正：OpenSSH 的版本能和 OSV 的 GIT 记录对上了。** openssh-portable 的标签写作 `V_7_5_P1`，版本写作 `7.5p1`，两者原来都化不成可比较的版本，OpenSSH 的 GIT 记录一律成了 in_triage；现在都规范成 `7.5p1`。用户固件 SBOM 里 OpenSSH 7.5p1 的 136 个漏洞有 65 个能直接判定，与 NVD 按 CPE 的结论在共有的 115 个里只有 4 个相左。
+
+## 0.18.2
+* **修正：发行版的记录不再判定上游组件。** 规则别名让 `pkg:github/openssl/openssl@1.0.2l` 这样的上游组件也能读到 Debian、Ubuntu、Alpine、Echo 的 OSV 记录，而发行版的范围从 `0` 开始、止于它自己的修复版本，拿上游版本去比，所有更旧的版本都落在范围内：Debian 记录的只影响 OpenSSL 3.0 的 CVE（如 CVE-2022-2274）因此把 1.0.2l 判成 exploitable，还盖过了 GIT 记录正确的 not affected。现在发行版的记录只判定该发行版的包；对上游组件，同一个漏洞有上游记录（GIT、NVD 等）时以上游记录为准，只有发行版记录的漏洞列为 in_triage 并说明原因。用户固件 SBOM 的 21 个组件读全部 OSV 数据时，exploitable 由 430 回到 48。
+* **修正：发行版包不再按同一发行版里另一个包的记录判定。** 规则别名把 `lua5.1` 和 `lua5.4` 归到同一个上游，`pkg:deb/debian/lua5.1@5.1.5-9` 原来会拿 lua5.4 的修复修订号比较；现在只读 SBOM 写的那个包自己的记录。
+
+## 0.18.1
+* **需要 gangmu-rules 2026.11.7。** 规则库又补了 569 条 `upstream.identifiers`，为 33 条原先没有 purl、OSV 记录够不着的规则补了 purl，38 条规则补上 OSV 实际登记它们的仓库，38 条规则新增 CPE，12 条 CPE 由 `a:` 改为 NVD 使用的 `o:`。其中 `pkg:generic/<主机>/<路径>` 形式的别名要本版才能匹配 OSV 的 GIT 记录。CI 固定到 v2026.11.7。
 * **Echo 发行版的包按 Echo 自己的 OSV 记录判定。** OSV 有 `Echo` 生态（Echo 的加固镜像基于 Debian，purl 为 `pkg:deb/echo/<包名>`，版本如 `1:1.3.dfsg+really1.3.1-1+e2`），现在和 Debian、Ubuntu 一样用 dpkg 顺序读它。把版本写进包名的 purl（`pkg:deb/echo/zlib-1.2.11`）会补上去掉版本的键，能对上发行版的记录。
 * **没有修订号的发行版包，先看上游版本。** 发行版把修复回移植进修订号，不会回移植进更旧的上游版本：上游版本低于每个修复的上游版本的，判为受影响；高于的判为不受影响；等于的仍要修订号才能判定。`pkg:deb/echo/zlib-1.2.11` 因此对 Echo 的两条 zlib 记录直接判为 exploitable，原来是 in_triage。
 * **经由规则别名命中的漏洞会注明。** 说明里写出经由哪个 `upstream.identifiers` 别名匹配；`gangmu vuln --no-purl-aliases` 只按 SBOM 写的 purl 匹配。
 * **修正：OSV 里挂在 kernel.org、savannah、sourceware 等仓库下的 GIT 记录不再被丢弃。** purl 规范没有这些主机的类型，原来读到这样的仓库地址就跳过整条记录（OSV 有 tftp-hpa、gdbm、binutils 等的记录）。现在映射成 `pkg:generic/<主机>/<路径>`，规则可以把它写进 `upstream.identifiers`；GitLab 子组的仓库映射成 `pkg:gitlab/<组>/<子组>/<项目>`。
-* **需要 gangmu-rules 2026.11.5。** 规则库里 358 条函数签名是用本版的函数抽取器重建的，485 条规则写了 `upstream.identifiers`；旧规则库的签名与本版抽取的函数对不上一部分。`pip install -U gangmu-sbom` 会一并升级规则库，CI 也固定到 v2026.11.5。
+
+## 0.18.0
+* **需要 gangmu-rules 2026.11.5。** 规则库里 358 条函数签名是用本版的函数抽取器重建的，170 条规则写了 `upstream.identifiers`；旧规则库的签名与本版抽取的函数对不上一部分。`pip install -U gangmu-sbom` 会一并升级规则库，CI 也固定到 v2026.11.5。
 * **发行版包按发行版自己的记录判定。** 发行版回移植修复而不改上游版本（Debian 在 `1:1.2.11.dfsg-4.1` 修了 zlib 的 CVE-2022-37434，上游版本仍是 1.2.11），所以对 `pkg:deb`、`pkg:apk` 组件，上游的受影响范围说明不了什么。现在 Debian、Ubuntu 用 dpkg 的版本顺序、Alpine 用 apk 的版本顺序，读各自发行版的 OSV 记录，并按发布版分开（发布版取自 purl 的 `distro` 限定符，或修订号里的 `+deb11u2`、`~22.04`）：修订号早于修复的为 exploitable，含修复的为 not affected，没有修订号或判定不了的为 in_triage。别的发行版的记录不参与判定；同一个 CVE 以发行版自己的结论为准。OSV 的 Ubuntu 记录现在会映射成 purl；Debian、Ubuntu 记录的 `upstream` 字段与 CVE 合并（DEBIAN-CVE-*、DSA-* 与 CVE 视为同一个漏洞）。
-* **规则可以写同一上游的其他 purl（`upstream.identifiers`）。** 镜像仓库、Debian/Ubuntu/Alpine 的包名都可以写进来。`gangmu vuln` 会给每个组件补上同一上游的其他 purl，所以挂在仓库下的 OSV 记录能找到写成 `pkg:deb/<发行版>/zlib-1.2.11` 的组件，反过来也一样。发行版 purl 比较时去掉发行版命名空间和名字里的 `-<版本>` 后缀；只合并规则明写的名字，不做相似度猜测。需要规则库 2026.11.5 或更新版本，它为 485 条规则写了这些名字。
+* **规则可以写同一上游的其他 purl（`upstream.identifiers`）。** 镜像仓库、Debian/Ubuntu/Alpine 的包名都可以写进来。`gangmu vuln` 会给每个组件补上同一上游的其他 purl，所以挂在仓库下的 OSV 记录能找到写成 `pkg:deb/<发行版>/zlib-1.2.11` 的组件，反过来也一样。发行版 purl 比较时去掉发行版命名空间和名字里的 `-<版本>` 后缀；只合并规则明写的名字，不做相似度猜测。需要规则库 2026.11.5 或更新版本，它为 170 条规则写了这些名字。
 * **修正：规则里的 `cpe_aliases` 现在会生效。** 原来别名停在规则里，旧厂商名下的 CVE（例如 cJSON 的 `davegamble:cjson`）永远匹配不上。现在 CycloneDX 写 `gangmu:cpeAlias`，SPDX 2.3/3.0 列出额外的 CPE，扫描结果的匹配也会用上它们。
 * **修正：函数抽取不再在各分支各开一个块的 `#if`/`#else` 处丢失后半个文件。** 抽取器把每个预处理分支里的大括号都计数，像 SQLite `winRead` 那样两个分支各写一个 `while (...) {`、只关一次的代码，就多出一层，从这里到文件末尾的函数全部找不到（SQLite 3.45.1 的 amalgamation 只抽出 676 个函数，止于第 48,962 行；现在 4,655 个）。现在每个 `#elif`/`#else` 分支从其 `#if` 处的深度开始，两个以上分支的深度变化相同且不为零时只算一次；其余情况（例如 `#ifdef X for (...) { #endif … #ifdef X } #endif`）仍按各分支相加。在 lwIP 2.2.0、Mbed TLS 3.6.2、FreeRTOS-Kernel 11.1.0、curl 8.11.0、libpng 1.6.44、cJSON 1.7.18、LVGL 9.2.2、wolfSSL 5.7.4、RT-Thread 5.1.0 上比较，旧版抽到的约 44 万个函数里有 34 个哈希变了，抽查都是旧版提前截断的函数（两个分支各写一个 `} while (...)`）；另外新找回约 7,600 个（curl `multi.c` 61 个，wolfSSL `internal.c` 395 个）。抽取耗时多约 35%，比分词少得多。**规则库里上游含这类代码的规则，函数签名要用新版重建**（GANGMU-SBOM/gangmu-rules），否则 `gangmu rules verify` 报不能复现。
 * **单个源文件的上限从 4 MiB 提到 16 MiB。** 超过上限的文件不读，SQLite 的 amalgamation（3.45.1 的 `sqlite3.c` 9 MB）原来整个被跳过。4 MiB 以上的文件只贡献函数，不计入整目录哈希（`fileset_sha256`）和 winnow 签名，所以规则里记录的这两项不变，不需要重建。

@@ -145,6 +145,12 @@ def test_a_purl_addressed_record_still_works(tmp_path):
     ("v3.1.0-pr1", "3.1.0-pr1"),
     ("8.3.3", "8.3.3"),
     ("8.4.0-pre1", "8.4.0-pre1"),
+    # OpenSSH portable: the tag and the version it names
+    ("V_7_5_P1", "7.5p1"),
+    ("7.5p1", "7.5p1"),
+    ("openssh-9.8p1", "9.8p1"),
+    # OpenSSL 1.0.2 ran past z
+    ("OpenSSL_1_0_2za", "1.0.2za"),
 ])
 def test_release_tags_normalize_to_comparable_versions(tag, expected):
     assert normalize_tag(tag) == expected
@@ -218,3 +224,18 @@ def test_a_record_under_a_kernel_org_repository_is_loaded_and_matched(tmp_path):
     found = match([cand], adv)
     assert [m.advisory.id for m in found] == ["TEST-K-1"]
 
+
+
+def test_an_openssh_portable_version_is_found_among_its_tags():
+    from gangmu.vuln.version import in_tag_set
+    tags = ["V_7_7_P1", "V_7_6_P1", "V_7_5_P1", "V_7_4_P1", "V_7_3_P1"]
+    assert in_tag_set("7.5p1", tags) is True
+
+
+@pytest.mark.parametrize("lower,higher", [
+    ("1.0.2l", "1.0.2za"), ("1.0.2z", "1.0.2za"), ("1.0.2za", "1.0.2zb"), ("1.0.2zh", "1.0.2zl"),
+    ("1.1.1", "1.1.1w"), ("1.2rc1", "1.2"),
+])
+def test_openssl_letter_releases_order(lower, higher):
+    from gangmu.vuln.version import compare
+    assert compare(lower, higher) == -1 and compare(higher, lower) == 1

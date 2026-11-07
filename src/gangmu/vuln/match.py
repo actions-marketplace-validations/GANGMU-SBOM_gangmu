@@ -171,6 +171,9 @@ class Candidate:
     alias_keys: frozenset = frozenset()
     """Purl keys added through rules' ``upstream.identifiers`` (not written in the SBOM):
     a match reached through one of them says so, so a reviewer can tell it apart."""
+    rule_cpes: frozenset = frozenset()
+    """CPEs taken from the rule that claims the component's purl, for a component the
+    SBOM gives no CPE: NVD's records are keyed by CPE, and a match through one says so."""
     linked: Optional[bool] = None
     """False when a link map showed none of the component's objects in the image;
     None when no link map was used (unknown, not "linked")."""
@@ -231,6 +234,10 @@ def candidates_from_cyclonedx(bom: dict, purl_aliases=None) -> List[Candidate]:
         from .aliases import without_name_version
         purls += [p for p in map(without_name_version, purls) if p and p not in purls]
         alias_keys: frozenset = frozenset()
+        rule_cpes: List[str] = []
+        if purl_aliases is not None and not cpes:
+            rule_cpes = purl_aliases.cpes_for(purls)
+            cpes = list(rule_cpes)
         if purl_aliases is not None:
             extra = purl_aliases.expand(purls)
             alias_keys = frozenset(k for k in map(purl_key, extra) if k)
@@ -243,6 +250,7 @@ def candidates_from_cyclonedx(bom: dict, purl_aliases=None) -> List[Candidate]:
             purls=purls,
             distro_package=distro,
             alias_keys=alias_keys,
+            rule_cpes=frozenset(rule_cpes),
             package_version=package_version if distro else None,
             distro_family=family.name if family else None,
             distro_release=(distver.release_from_purl(family_purl, package_version)
@@ -372,23 +380,66 @@ def match(candidates: Sequence[Candidate], advisories: Sequence[Advisory],
         # Most serious state first; then the record filed under the CVE id itself.
         return (severity.get(m.state, 3), m.advisory.id.upper() != canonical)
 
-    def keep(token: tuple, new: Match) -> None:
+    # A distribution's verdict on its own package (from the package revision) outranks
+    # any upstream range; NVD's CPE range and an OSV record that contradict each other
+    # (one "affected", the other "not affected") leave it to a person.
+    settled: set = set()
+    disputed: set = set()
+    # A record that cannot place the version in its range (no comparable versions,
+    # commits only) says nothing; a verdict from another record of the same
+    # vulnerability stands over it.
+    undecided: set = set()
+
+    def source(m: Match) -> str:
+        return f"{m.advisory.id} ({'NVD CPE range' if m.channel == 'cpe' else 'OSV, by purl'})"
+
+    def keep(token: tuple, new: Match, authoritative: bool = False,
+             unplaced: bool = False) -> None:
         if per_channel:
             token = (new.advisory.id.upper(), token[1], new.channel)
         old = found.get(token)
         if old is None:
             found[token] = new
+            if authoritative:
+                settled.add(token)
+            elif unplaced:
+                undecided.add(token)
             return
-        best, other = (new, old) if rank(new, token[0]) < rank(old, token[0]) else (old, new)
+        if not per_channel and (token in settled) != authoritative:
+            best, other = (old, new) if token in settled else (new, old)
+            settled.add(token)
+            disputed.discard(token)
+            undecided.discard(token)
+        elif not per_channel and token in disputed:
+            best, other = old, new
+        elif not per_channel and unplaced and token not in undecided:
+            best, other = old, new          # a verdict already given stands
+        elif not per_channel and token in undecided and not unplaced:
+            best, other = new, old          # the first verdict replaces "cannot tell"
+            undecided.discard(token)
+        elif (not per_channel and old.channel != new.channel
+              and {old.state, new.state} == {VexState.EXPLOITABLE, VexState.NOT_AFFECTED}):
+            hit, miss = (old, new) if old.state is VexState.EXPLOITABLE else (new, old)
+            best = replace(hit, state=VexState.IN_TRIAGE,
+                           detail=f"the sources disagree: {source(hit)} puts version "
+                                  f"{hit.version} in range ({hit.detail}), {source(miss)} "
+                                  f"does not ({miss.detail}); read the advisory")
+            other = miss
+            disputed.add(token)
+        else:
+            best, other = (new, old) if rank(new, token[0]) < rank(old, token[0]) else (old, new)
         if best.advisory is not other.advisory:
             best.advisory = _merged(best.advisory, other.advisory)
         found[token] = best
 
     for candidate in candidates:
+        cpe_seen: set = set()
         for cpe in candidate.cpes:
             key = cpe_product_key(cpe)
             for advisory, rng in by_cpe.get(key or "", []):
+                cpe_seen.add(vulnerability_key(advisory))
                 verdict = None
+                listed_only = False
                 if candidate.version and is_orderable(candidate.version):
                     verdict = in_range(
                         candidate.version,
@@ -402,19 +453,29 @@ def match(candidates: Sequence[Candidate], advisories: Sequence[Advisory],
                             from .version import compare
                             cmp = compare(candidate.version, pinned)
                             verdict = (cmp == 0) if cmp is not None else None
+                            # NVD naming releases one by one (openssl:1.0.2, :1.1.1,
+                            # :3.0.0 for CVE-2023-3446, meaning those lines): absent from
+                            # the list is no verdict another record could not override.
+                            listed_only = verdict is False
                 state, detail = _state_for(candidate, verdict)
-                if state is VexState.NOT_AFFECTED and not include_not_affected:
-                    continue
+                if cpe in candidate.rule_cpes:
+                    detail += (" (CPE taken from the rule that claims this component's purl; "
+                               "the SBOM gives none)")
                 keep((vulnerability_key(advisory), candidate.directory),
                      Match(advisory=advisory, component=candidate.name,
                            directory=candidate.directory,
                            version=candidate.version, channel="cpe",
                            matched_on=rng["cpe"], state=state, detail=detail,
-                           component_confidence=candidate.confidence))
+                           component_confidence=candidate.confidence),
+                     unplaced=verdict is None or listed_only)
 
         # A distribution package: its distribution's own records settle it before the
         # upstream ranges are looked at, so they are read first.
         decided: set = set()
+        # An upstream component reached by a distribution's record (through an alias):
+        # kept aside, and reported only for vulnerabilities no upstream record names.
+        distro_only: Dict[str, tuple] = {}
+        upstream_seen: set = set()
         ordered = (sorted(candidate.purls, key=lambda p: distver.family_of_purl(p) is None)
                    if candidate.distro_package else candidate.purls)
         for purl in ordered:
@@ -425,6 +486,10 @@ def match(candidates: Sequence[Candidate], advisories: Sequence[Advisory],
                 if range_family is not None:
                     if range_family.name != candidate.distro_family:
                         continue        # another distribution's package: not this one
+                    if key in candidate.alias_keys:
+                        # Another package of the same distribution, reached only through an
+                        # alias (lua5.1 -> lua5.4): its revisions say nothing of this one's.
+                        continue
                     vkey = vulnerability_key(advisory)
                     if vkey in done or rng.get("type") == "GIT":
                         continue
@@ -459,17 +524,26 @@ def match(candidates: Sequence[Candidate], advisories: Sequence[Advisory],
                                          f"package {package} carries the {name} fix"
                                          if candidate.package_version else
                                          f"upstream release {package} is newer than every {name} fix's")
-                    if state is VexState.NOT_AFFECTED and not include_not_affected:
-                        continue
                     keep((vkey, candidate.directory),
                          Match(advisory=advisory, component=candidate.name,
                                directory=candidate.directory, version=candidate.version,
                                channel="purl", matched_on=rng["purl"], state=state,
                                detail=_via_alias(detail, candidate, key),
-                               component_confidence=candidate.confidence))
+                               component_confidence=candidate.confidence),
+                         authoritative=answer is not None)
                     continue
                 if vulnerability_key(advisory) in decided:
                     continue            # the distribution's revision verdict outranks upstream's range
+                key_family = None if candidate.distro_package else distver.family_of_key(key)
+                if key_family is not None:
+                    # A distribution's range is in its own package versions and starts at
+                    # "0": it says when the distribution fixed it, not which upstream
+                    # releases are affected (Debian files OpenSSL 3.0-only CVEs that
+                    # 1.0.2 never had). It decides nothing for an upstream component.
+                    distro_only.setdefault(vulnerability_key(advisory),
+                                           (advisory, rng, key, key_family.name.capitalize()))
+                    continue
+                upstream_seen.add(vulnerability_key(advisory))
                 verdict = None
                 if rng.get("type") == "GIT" and rng.get("extracted"):
                     verdict = in_event_ranges(candidate.version, rng["extracted"])
@@ -485,17 +559,35 @@ def match(candidates: Sequence[Candidate], advisories: Sequence[Advisory],
                     candidate, verdict,
                     commit_only=(rng.get("type") == "GIT" and not rng.get("tags")
                                  and not rng.get("extracted")))
-                if state is VexState.NOT_AFFECTED and not include_not_affected:
-                    continue
                 keep((vulnerability_key(advisory), candidate.directory),
                      Match(advisory=advisory, component=candidate.name,
                            directory=candidate.directory,
                            version=candidate.version, channel="purl",
                            matched_on=rng["purl"], state=state,
                            detail=_via_alias(detail, candidate, key),
-                           component_confidence=candidate.confidence))
+                           component_confidence=candidate.confidence),
+                     # "Not in the record's tag list" is inferred from what OSV listed,
+                     # and those lists miss releases of multi-branch projects (OpenSSH
+                     # 7.5p1 for CVE-2023-51767, "through 10.0"): it settles nothing
+                     # another record leaves open.
+                     unplaced=verdict is None or (
+                         verdict is False and rng.get("type") == "GIT"
+                         and not rng.get("extracted")))
 
-    out: List[Match] = list(found.values())
+        for vkey, (advisory, rng, key, name) in distro_only.items():
+            if vkey in upstream_seen or vkey in cpe_seen:
+                continue
+            detail = (f"only {name}'s records name this vulnerability, and a distribution's "
+                      f"ranges give its own package versions, not the upstream releases affected")
+            keep((vkey, candidate.directory),
+                 Match(advisory=advisory, component=candidate.name,
+                       directory=candidate.directory, version=candidate.version,
+                       channel="purl", matched_on=rng["purl"], state=VexState.IN_TRIAGE,
+                       detail=_via_alias(detail, candidate, key),
+                       component_confidence=candidate.confidence))
+
+    out: List[Match] = [m for m in found.values()
+                        if include_not_affected or m.state is not VexState.NOT_AFFECTED]
 
     order = {VexState.EXPLOITABLE: 0, VexState.IN_TRIAGE: 1,
              VexState.NOT_AFFECTED: 2}
